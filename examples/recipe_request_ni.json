@@ -1,0 +1,48 @@
+{
+  "target_film_material": "NiSi",
+  "target_phase_target": {
+    "type": "phase_label",
+    "value": "NiSi"
+  },
+  "knowledge_run_dir": "/private/tmp/oarp_day3_20260307g",
+  "system_family_hint": "nickel-silicide",
+  "numeric_constraints": {
+    "anneal_temperature_c": {
+      "min": 250,
+      "max": 700
+    },
+    "anneal_time_s": {
+      "min": 10,
+      "max": 3600
+    }
+  },
+  "text_constraints": {
+    "substrate_material": [
+      "Si"
+    ],
+    "method_family": [
+      "PVD",
+      "ALD"
+    ],
+    "precursor": [
+      "Ni target"
+    ]
+  },
+  "objective": {
+    "target_quality_numeric": {
+      "min": 0.75
+    },
+    "priority": "target-satisfaction"
+  },
+  "gate_profile": "progressive_default",
+  "max_candidates": 200,
+  "top_k": 10,
+  "max_retry_loops": 2,
+  "safety_policy": {
+    "forbidden_precursors": [],
+    "forbidden_methods": [],
+    "max_pressure_pa": 200000.0,
+    "max_temperature_c": 900.0,
+    "notes": "default policy"
+  }
+}

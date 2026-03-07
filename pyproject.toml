@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oa-research-pipeline"
+version = "0.1.0"
+description = "Topic-agnostic open-access research extraction pipeline with citation-backed plots"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+  {name = "moon.s.june"}
+]
+keywords = ["open-access", "literature", "extraction", "plot", "citation", "research"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+dependencies = [
+  "PyYAML>=6.0",
+  "requests>=2.32.0",
+  "pandas>=2.2.0",
+  "pyarrow>=16.0.0",
+  "numpy>=1.26.0",
+  "matplotlib>=3.8.0",
+  "pydantic>=2.8.0",
+  "beautifulsoup4>=4.12.0",
+  "lxml>=5.2.0",
+  "scikit-learn>=1.5.0",
+]
+
+[project.optional-dependencies]
+ml = [
+  "torch>=2.4.0",
+  "torch-geometric>=2.6.0",
+  "xgboost>=2.1.0",
+  "lightgbm>=4.5.0",
+]
+html = [
+  "trafilatura>=1.9.0",
+]
+pdf = [
+  "pypdf>=5.0.0",
+  "pdfplumber>=0.11.0",
+]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-cov>=5.0.0",
+  "ruff>=0.8.0",
+  "mypy>=1.11.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/sacRedeeRhoRn/agents-inc"
+Repository = "https://github.com/sacRedeeRhoRn/agents-inc"
+Issues = "https://github.com/sacRedeeRhoRn/agents-inc/issues"
+
+[project.scripts]
+oarp = "oarp.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]
