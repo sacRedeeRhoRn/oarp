@@ -1,0 +1,75 @@
+topic_id: ni-silicide-phase-window
+question_template: >-
+  Depending on thickness of as-deposited Nickel film, at which temperature,
+  the phases with composition Ni2Si, NiSi, NiSi2 appear?
+keywords:
+  - nickel silicide
+  - Ni2Si
+  - NiSi
+  - NiSi2
+  - thin film
+  - annealing temperature
+  - substrate orientation
+  - doping
+  - alloying
+
+eligibility:
+  article_types:
+    - journal-article
+    - preprint
+  oa_required: true
+  languages:
+    - en
+
+variables:
+  - name: thickness_nm
+    aliases: ["thickness", "film thickness", "nickel thickness", "nm thickness"]
+    unit: nm
+    datatype: float
+    normalization: length
+    min_value: 0
+
+  - name: temperature_c
+    aliases: ["temperature", "annealing temperature", "anneal temp", "temperature c"]
+    unit: c
+    datatype: float
+    normalization: temperature
+    min_value: 20
+    max_value: 1400
+
+entities:
+  - name: Ni2Si
+    aliases: ["ni2si", "nickel disilicide precursor"]
+  - name: NiSi
+    aliases: ["nisi", "nickel monosilicide"]
+  - name: NiSi2
+    aliases: ["nisi2", "nickel disilicide"]
+
+extraction_rules:
+  confidence_thresholds:
+    text: 0.65
+    table: 0.8
+    figure: 0.7
+  figure_cues: ["figure", "fig.", "fig "]
+
+plot:
+  primary:
+    x: thickness_nm
+    y: temperature_c
+    color_by: entity
+    transparency_policy: outlier-transparent
+
+consensus:
+  model: confidence-consensus
+  entropy_threshold: 0.72
+  outlier_policy: show-transparent
+
+validation:
+  min_confidence: 0.68
+  required_provenance_fields:
+    - citation_url
+    - snippet
+    - locator
+
+plugins:
+  preferred_plugin: materials_ni_silicide

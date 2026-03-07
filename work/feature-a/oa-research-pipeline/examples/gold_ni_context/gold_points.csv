@@ -1,0 +1,5 @@
+x_value,y_value,entity,substrate_material,substrate_orientation,doping_state,alloy_state
+3,290,Ni2Si,Si,(100),na_pure_ni,na_pure_ni
+20,260,Ni2Si,Si,(100),na_pure_ni,na_pure_ni
+30,340,NiSi,Si,(100),na_pure_ni,na_pure_ni
+60,520,NiSi2,Si,(100),na_pure_ni,na_pure_ni
