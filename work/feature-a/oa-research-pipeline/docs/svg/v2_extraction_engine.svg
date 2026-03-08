@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0e1326"/>
+      <stop offset="100%" stop-color="#17213f"/>
+    </linearGradient>
+    <linearGradient id="chip" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#224e76"/>
+      <stop offset="100%" stop-color="#1d6b85"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9cdfff"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <text x="72" y="82" fill="#f1fbff" font-size="44" font-family="Segoe UI, Arial, sans-serif" font-weight="700">SLM Extraction Engine</text>
+  <text x="72" y="122" fill="#a6d2ff" font-size="22" font-family="Segoe UI, Arial, sans-serif">Mandatory TGI path. Structured, parallel, and provenance-first.</text>
+
+  <rect x="70" y="180" width="300" height="140" rx="22" fill="url(#chip)" stroke="#66ddff" stroke-width="2"/>
+  <text x="95" y="240" fill="#e9fbff" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Doc Chunker</text>
+  <text x="95" y="276" fill="#cbf0ff" font-size="20" font-family="Segoe UI, Arial, sans-serif">sentence-safe windows</text>
+
+  <rect x="450" y="180" width="300" height="140" rx="22" fill="url(#chip)" stroke="#66ddff" stroke-width="2"/>
+  <text x="475" y="240" fill="#e9fbff" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Prompt Builder</text>
+  <text x="475" y="276" fill="#cbf0ff" font-size="20" font-family="Segoe UI, Arial, sans-serif">JSON schema locked</text>
+
+  <rect x="830" y="180" width="300" height="140" rx="22" fill="url(#chip)" stroke="#66ddff" stroke-width="2"/>
+  <text x="855" y="240" fill="#e9fbff" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">TGI Workers</text>
+  <text x="855" y="276" fill="#cbf0ff" font-size="20" font-family="Segoe UI, Arial, sans-serif">single or multi endpoint</text>
+
+  <rect x="1210" y="180" width="320" height="140" rx="22" fill="url(#chip)" stroke="#66ddff" stroke-width="2"/>
+  <text x="1235" y="240" fill="#e9fbff" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Vote + Assemble</text>
+  <text x="1235" y="276" fill="#cbf0ff" font-size="20" font-family="Segoe UI, Arial, sans-serif">point-level consensus</text>
+
+  <rect x="230" y="430" width="1140" height="300" rx="24" fill="#15264a" stroke="#5ad5ff" stroke-width="2"/>
+  <text x="270" y="478" fill="#f0fcff" font-size="28" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Validation Mesh</text>
+  <text x="270" y="520" fill="#c5eaff" font-size="22" font-family="Segoe UI, Arial, sans-serif">schema valid + rule valid + unit normalization + provenance completeness</text>
+  <text x="270" y="560" fill="#c5eaff" font-size="22" font-family="Segoe UI, Arial, sans-serif">thickness_asdep_nm / thickness_anneal_nm role-aware semantics</text>
+  <text x="270" y="600" fill="#c5eaff" font-size="22" font-family="Segoe UI, Arial, sans-serif">MP interpretation adds confidence shaping, not hard reject (interpreter mode)</text>
+
+  <text x="270" y="670" fill="#8fffd2" font-size="21" font-family="Segoe UI, Arial, sans-serif">Outputs: slm_requests, slm_responses, slm_points_raw, slm_points_voted, evidence_points, validated_points</text>
+
+  <line x1="370" y1="250" x2="450" y2="250" stroke="#9cdfff" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="750" y1="250" x2="830" y2="250" stroke="#9cdfff" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="1130" y1="250" x2="1210" y2="250" stroke="#9cdfff" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="1370" y1="320" x2="860" y2="430" stroke="#9cdfff" stroke-width="4" marker-end="url(#arrow)"/>
+</svg>

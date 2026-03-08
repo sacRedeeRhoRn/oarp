@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1020"/>
+      <stop offset="50%" stop-color="#111a34"/>
+      <stop offset="100%" stop-color="#1b2748"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1f2f57"/>
+      <stop offset="100%" stop-color="#24376a"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#5ad5ff"/>
+      <stop offset="100%" stop-color="#5fffb7"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9fe7ff"/>
+    </marker>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <text x="70" y="85" fill="#eaf8ff" font-size="46" font-family="Segoe UI, Arial, sans-serif" font-weight="700">OARP v2 Flow</text>
+  <text x="70" y="125" fill="#9ed4ff" font-size="22" font-family="Segoe UI, Arial, sans-serif">SSD-first, TGI extraction, dual graph intelligence, and recipe synthesis.</text>
+
+  <rect x="70" y="170" rx="26" ry="26" width="300" height="620" fill="url(#panel)" stroke="#5ad5ff" stroke-width="2"/>
+  <text x="96" y="220" fill="#d9f6ff" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">1. Ingest</text>
+  <text x="96" y="260" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">Online OA + Local PDF</text>
+  <text x="96" y="300" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">discover -> acquire</text>
+  <text x="96" y="340" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">quality gate on text</text>
+  <text x="96" y="410" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">articles.parquet</text>
+  <text x="96" y="438" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">documents.parquet</text>
+
+  <rect x="430" y="170" rx="26" ry="26" width="330" height="620" fill="url(#panel)" stroke="#5ad5ff" stroke-width="2"/>
+  <text x="456" y="220" fill="#d9f6ff" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">2. Extract</text>
+  <text x="456" y="260" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">mandatory SLM via TGI</text>
+  <text x="456" y="300" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">schema + vote + provenance</text>
+  <text x="456" y="340" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">mp-enrich (interpreter)</text>
+  <text x="456" y="410" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">evidence_points.parquet</text>
+  <text x="456" y="438" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">validated_points.parquet</text>
+  <text x="456" y="466" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">consensus_points.parquet</text>
+
+  <rect x="820" y="170" rx="26" ry="26" width="330" height="620" fill="url(#panel)" stroke="#5ad5ff" stroke-width="2"/>
+  <text x="846" y="220" fill="#d9f6ff" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">3. Learn</text>
+  <text x="846" y="260" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">dual graph build</text>
+  <text x="846" y="300" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">GNN encoder</text>
+  <text x="846" y="340" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">tabular fusion head</text>
+  <text x="846" y="380" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">system fine-tune slice</text>
+  <text x="846" y="450" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">gnn_base / tabular_head</text>
+  <text x="846" y="478" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">finetune_model</text>
+
+  <rect x="1210" y="170" rx="26" ry="26" width="320" height="620" fill="url(#panel)" stroke="#5ad5ff" stroke-width="2"/>
+  <text x="1236" y="220" fill="#d9f6ff" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">4. Deliver</text>
+  <text x="1236" y="260" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">plots + report</text>
+  <text x="1236" y="300" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">recipe cards</text>
+  <text x="1236" y="340" fill="#b8ddff" font-size="20" font-family="Segoe UI, Arial, sans-serif">obsidian vault export</text>
+  <text x="1236" y="410" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">outputs/report.md</text>
+  <text x="1236" y="438" fill="#8ef2d2" font-size="18" font-family="Segoe UI, Arial, sans-serif">outputs/vault/</text>
+
+  <path d="M 370 480 C 400 480, 405 480, 430 480" stroke="#9fe7ff" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 760 480 C 790 480, 790 480, 820 480" stroke="#9fe7ff" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 1150 480 C 1180 480, 1180 480, 1210 480" stroke="#9fe7ff" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+
+  <rect x="520" y="770" width="560" height="60" rx="14" fill="#15284b" stroke="url(#accent)" stroke-width="2" filter="url(#glow)"/>
+  <text x="548" y="808" fill="#d6fff1" font-size="24" font-family="Segoe UI, Arial, sans-serif">Quality-first gates decide scale-up: 300 -> 1000 -> 3000 -> 10000</text>
+</svg>
