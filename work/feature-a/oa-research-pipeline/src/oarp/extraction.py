@@ -2026,6 +2026,11 @@ def _run_tgi_slm_extraction(
     provenance_rows: list[dict[str, Any]] = []
     coverage_rows: list[dict[str, Any]] = []
     feature_cache = prepare_feature_cache(cfg)
+    use_response_cache = str(getattr(cfg, "slm_response_cache", "on") or "on").strip().lower() != "off"
+    max_doc_chars = max(0, int(getattr(cfg, "slm_max_doc_chars", 0) or 0))
+    max_chunks_per_doc = max(0, int(getattr(cfg, "slm_max_chunks_per_doc", 0) or 0))
+    stage_timeout_sec = max(0, int(getattr(cfg, "extract_stage_timeout_sec", 0) or 0))
+    stage_started = time.perf_counter()
 
     workers = max(1, int(cfg.tgi_workers or 1))
 
@@ -2044,8 +2049,12 @@ def _run_tgi_slm_extraction(
             str(model_id),
             hashlib.sha1(str(prompt).encode("utf-8", errors="replace")).hexdigest(),
         )
-        cached = feature_cache.get_json("slm_tgi_response", cache_key, ttl_hours=int(cfg.cache_ttl_hours))
-        if isinstance(cached, dict) and str(cached.get("status") or "") == "ok":
+        cached = (
+            feature_cache.get_json("slm_tgi_response", cache_key, ttl_hours=int(cfg.cache_ttl_hours))
+            if use_response_cache
+            else None
+        )
+        if use_response_cache and isinstance(cached, dict) and str(cached.get("status") or "") == "ok":
             body_text = str(cached.get("response_json") or "")
             latency_ms = int(cached.get("latency_ms") or 0)
             response_rows.append(
@@ -2121,7 +2130,7 @@ def _run_tgi_slm_extraction(
         except Exception as exc:
             body_text = str(exc)
         latency_ms = int((time.perf_counter() - started) * 1000.0)
-        if status == "ok":
+        if status == "ok" and use_response_cache:
             feature_cache.put_json(
                 "slm_tgi_response",
                 cache_key,
@@ -2234,9 +2243,27 @@ def _run_tgi_slm_extraction(
         return added
 
     for doc_row in documents.to_dict(orient="records"):
+        if stage_timeout_sec > 0 and (time.perf_counter() - stage_started) > float(stage_timeout_sec):
+            coverage_rows.append(
+                {
+                    "article_key": str(doc_row.get("article_key") or ""),
+                    "provider": str(doc_row.get("provider") or ""),
+                    "parse_status": str(doc_row.get("parse_status") or ""),
+                    "usable_text": False,
+                    "candidate_windows": 0,
+                    "matched_points": 0,
+                    "matched_variables": 0,
+                    "provenance_rows": 0,
+                    "drop_reason": "extract_stage_timeout",
+                    "created_at": now_iso(),
+                }
+            )
+            break
         article_key = str(doc_row.get("article_key") or "")
         provider = str(doc_row.get("provider") or "")
         text_content = str(doc_row.get("text_content") or "")
+        if max_doc_chars > 0 and len(text_content) > max_doc_chars:
+            text_content = text_content[:max_doc_chars]
         source_url = str(doc_row.get("source_url") or "")
         article = article_map.get(article_key, {})
         citation_url = str(article.get("oa_url") or article.get("source_url") or source_url)
@@ -2259,6 +2286,8 @@ def _run_tgi_slm_extraction(
             continue
         doc_id = hashlib.sha1(f"{provider}|{article_key}".encode("utf-8", errors="replace")).hexdigest()[:16]
         chunks = _chunk_sentences(text_content, cfg.slm_chunk_tokens, cfg.slm_overlap_tokens)
+        if max_chunks_per_doc > 0 and len(chunks) > max_chunks_per_doc:
+            chunks = chunks[:max_chunks_per_doc]
         if not chunks:
             coverage_rows.append(
                 {
@@ -2277,7 +2306,25 @@ def _run_tgi_slm_extraction(
             continue
 
         matched_before = len(raw_point_rows)
+        doc_timed_out = False
         for chunk_idx, chunk_text in chunks:
+            if stage_timeout_sec > 0 and (time.perf_counter() - stage_started) > float(stage_timeout_sec):
+                coverage_rows.append(
+                    {
+                        "article_key": article_key,
+                        "provider": provider,
+                        "parse_status": str(doc_row.get("parse_status") or ""),
+                        "usable_text": True,
+                        "candidate_windows": len(chunks),
+                        "matched_points": max(0, len(raw_point_rows) - matched_before),
+                        "matched_variables": 0,
+                        "provenance_rows": max(0, len(provenance_rows)),
+                        "drop_reason": "extract_stage_timeout",
+                        "created_at": now_iso(),
+                    }
+                )
+                doc_timed_out = True
+                break
             chunk_id = f"{doc_id}:chunk:{chunk_idx}"
             prompt = _build_tgi_prompt(spec, chunk_text)
             prompt_hash = hashlib.sha1(prompt.encode("utf-8", errors="replace")).hexdigest()[:20]
@@ -2506,6 +2553,8 @@ def _run_tgi_slm_extraction(
                     min_confidence=0.55,
                 )
 
+        if doc_timed_out:
+            continue
         matched = max(0, len(raw_point_rows) - matched_before)
         coverage_rows.append(
             {

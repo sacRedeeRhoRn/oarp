@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -161,6 +162,60 @@ def _target_python(cfg: RunConfig) -> str:
     return sys.executable
 
 
+def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.2)
+        return sock.connect_ex((host, int(port))) == 0
+    except Exception:
+        return False
+    finally:
+        sock.close()
+
+
+def _parse_port_range(raw: str, fallback: int) -> list[int]:
+    text = str(raw or "").strip()
+    if "-" in text:
+        left, right = text.split("-", 1)
+        try:
+            start = int(left.strip())
+            end = int(right.strip())
+            if start > end:
+                start, end = end, start
+            return [port for port in range(max(1, start), min(65535, end) + 1)]
+        except Exception:
+            pass
+    if "," in text:
+        out: list[int] = []
+        for token in text.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                value = int(token)
+            except Exception:
+                continue
+            if 1 <= value <= 65535:
+                out.append(value)
+        if out:
+            return out
+    return [int(fallback)]
+
+
+def _select_tgi_port(cfg: RunConfig) -> tuple[int, str]:
+    desired = int(cfg.tgi_port)
+    policy = str(getattr(cfg, "tgi_port_policy", "reuse_or_allocate") or "reuse_or_allocate").strip().lower()
+    if not _port_in_use(desired):
+        return desired, "desired_free"
+    if policy != "reuse_or_allocate":
+        return desired, "desired_in_use"
+    candidates = _parse_port_range(str(getattr(cfg, "tgi_port_range", "8080-8090") or "8080-8090"), desired)
+    for port in candidates:
+        if not _port_in_use(port):
+            return int(port), "allocated_from_range"
+    return desired, "range_exhausted"
+
+
 def _python_version_from_exec(python_exec: str) -> tuple[bool, str]:
     script = "import sys; print(sys.version.split()[0])"
     rc, out, err = _run_cmd([python_exec, "-c", script], timeout_sec=30)
@@ -294,7 +349,7 @@ def tgi_status(cfg: RunConfig, *, check_generate: bool = False) -> dict[str, Any
 def tgi_start(cfg: RunConfig) -> dict[str, Any]:
     mode = str(cfg.tgi_mode or "docker").strip().lower()
     name = _container_name(cfg)
-    status = tgi_status(cfg, check_generate=(mode == "external"))
+    status = tgi_status(cfg, check_generate=(mode == "external" or bool(getattr(cfg, "tgi_reuse_existing", True))))
     if mode == "external":
         ok = bool(status.get("healthy")) and bool(status.get("generate_ok"))
         return {
@@ -303,10 +358,12 @@ def tgi_start(cfg: RunConfig) -> dict[str, Any]:
             **status,
         }
 
-    if status.get("healthy") and status.get("container_running"):
+    if status.get("healthy") and status.get("generate_ok") and (
+        status.get("container_running") or bool(getattr(cfg, "tgi_reuse_existing", True))
+    ):
         return {
             "ok": True,
-            "action": "already_healthy",
+            "action": "already_healthy" if status.get("container_running") else "reuse_existing_healthy_endpoint",
             **status,
         }
     if not shutil.which("docker"):
@@ -314,6 +371,17 @@ def tgi_start(cfg: RunConfig) -> dict[str, Any]:
             "ok": False,
             "action": "docker_missing",
             **status,
+        }
+
+    selected_port, port_reason = _select_tgi_port(cfg)
+    if selected_port != int(cfg.tgi_port):
+        cfg.tgi_port = int(selected_port)
+    if _port_in_use(int(cfg.tgi_port)):
+        return {
+            "ok": False,
+            "action": "port_in_use",
+            "port_reason": port_reason,
+            **tgi_status(cfg),
         }
 
     _run_cmd(["docker", "rm", "-f", name], timeout_sec=120)
@@ -352,6 +420,7 @@ def tgi_start(cfg: RunConfig) -> dict[str, Any]:
             "selected_tgi_platform": selected_platform,
             "tgi_emulation_used": emulation_used,
             "tgi_platform_reason": platform_reason,
+            "port_reason": port_reason,
             **tgi_status(cfg),
         }
 
@@ -371,6 +440,7 @@ def tgi_start(cfg: RunConfig) -> dict[str, Any]:
         "selected_tgi_platform": selected_platform,
         "tgi_emulation_used": emulation_used,
         "tgi_platform_reason": platform_reason,
+        "port_reason": port_reason,
         **last,
     }
 

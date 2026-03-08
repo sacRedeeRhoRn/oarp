@@ -72,6 +72,7 @@ _NODE_TYPES = [
 ]
 _FORMULA_TOKEN_RE = re.compile(r"([A-Z][a-z]?)(\d*(?:\.\d+)?)")
 _SPACEGROUP_CLEAN_RE = re.compile(r"[^A-Za-z0-9]")
+_FEATURE_NAME_CLEAN_RE = re.compile(r"[^0-9A-Za-z_]+")
 
 
 @dataclass
@@ -1110,6 +1111,25 @@ def _ndcg_at_k(scores: np.ndarray, relevance: np.ndarray, k: int = 10) -> float:
     return float(dcg / idcg)
 
 
+def _canonical_feature_name(raw_name: Any) -> str:
+    raw = str(raw_name or "")
+    base = _FEATURE_NAME_CLEAN_RE.sub("_", raw).strip("_").lower()
+    if not base:
+        base = "feature"
+    if base[0].isdigit():
+        base = f"f_{base}"
+    digest = hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:10]
+    return f"{base}__{digest}"
+
+
+def _canonicalize_feature_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    out = frame.copy()
+    out.columns = [_canonical_feature_name(col) for col in out.columns]
+    return out
+
+
 def _prepare_matrix(frame: pd.DataFrame, feature_columns: list[str] | None = None) -> tuple[pd.DataFrame, list[str]]:
     numeric_cols = _NUMERIC_FEATURES + [
         "graph_degree_phase",
@@ -1128,6 +1148,7 @@ def _prepare_matrix(frame: pd.DataFrame, feature_columns: list[str] | None = Non
     numeric = out[numeric_cols].copy()
     cat = pd.get_dummies(out[_CATEGORICAL_FEATURES].astype(str), prefix=_CATEGORICAL_FEATURES, dtype=float)
     x = pd.concat([numeric, cat], axis=1).fillna(0.0)
+    x = _canonicalize_feature_columns(x)
     if feature_columns is None:
         return x, list(x.columns)
     return x.reindex(columns=feature_columns, fill_value=0.0), list(feature_columns)
@@ -2116,7 +2137,62 @@ def _evaluate_model_on_frame(
     )
 
 
-def evaluate_processor(run_dir: str | Path, cfg: RunConfig) -> dict[str, Any]:
+def _policy_gate_payload(
+    *,
+    cfg: RunConfig,
+    base_eval: dict[str, float],
+    base_slice: dict[str, float],
+    finetune_eval: dict[str, float],
+    slice_rows: int,
+    support_articles: int,
+) -> tuple[dict[str, Any], dict[str, float], str]:
+    f1_uplift = float(finetune_eval.get("phase_macro_f1", 0.0) - base_slice.get("phase_macro_f1", 0.0))
+    ndcg_uplift = float(finetune_eval.get("ndcg_at_10", 0.0) - base_slice.get("ndcg_at_10", 0.0))
+    policy = str(cfg.finetune_gate_policy or "absolute_uplift").strip().lower()
+    if policy not in {"absolute_uplift", "ceiling_aware", "non_degradation"}:
+        policy = "absolute_uplift"
+
+    base_f1 = float(base_slice.get("phase_macro_f1", 0.0))
+    base_ndcg = float(base_slice.get("ndcg_at_10", 0.0))
+    tuned_f1 = float(finetune_eval.get("phase_macro_f1", 0.0))
+    tuned_ndcg = float(finetune_eval.get("ndcg_at_10", 0.0))
+    threshold = float(cfg.finetune_ceiling_threshold or 0.95)
+    min_rows = max(1, int(cfg.finetune_min_slice_rows or 1))
+    min_articles = max(1, int(cfg.finetune_min_support_articles or 1))
+
+    if policy == "absolute_uplift":
+        branch = "uplift_required"
+        f1_gate = bool(f1_uplift >= 0.05)
+        ndcg_gate = bool(ndcg_uplift >= 0.05)
+    elif policy == "non_degradation":
+        branch = "non_degradation_required"
+        f1_gate = bool(tuned_f1 >= (base_f1 - 1e-9))
+        ndcg_gate = bool(tuned_ndcg >= (base_ndcg - 1e-9))
+    else:
+        f1_at_ceiling = bool(base_f1 >= threshold)
+        ndcg_at_ceiling = bool(base_ndcg >= threshold)
+        if f1_at_ceiling and ndcg_at_ceiling:
+            branch = "ceiling_non_degradation"
+        elif f1_at_ceiling or ndcg_at_ceiling:
+            branch = "ceiling_mixed"
+        else:
+            branch = "ceiling_uplift_required"
+        f1_gate = bool(tuned_f1 >= (base_f1 - 1e-9)) if f1_at_ceiling else bool(f1_uplift >= 0.05)
+        ndcg_gate = bool(tuned_ndcg >= (base_ndcg - 1e-9)) if ndcg_at_ceiling else bool(ndcg_uplift >= 0.05)
+
+    gates = {
+        "base_phase_macro_f1_ge_0_80": bool(base_eval.get("phase_macro_f1", 0.0) >= 0.80),
+        "base_ndcg_at_10_ge_0_75": bool(base_eval.get("ndcg_at_10", 0.0) >= 0.75),
+        "finetune_support_rows_gate": bool(slice_rows >= min_rows),
+        "finetune_support_articles_gate": bool(support_articles >= min_articles),
+        "finetune_f1_policy_gate": bool(f1_gate),
+        "finetune_ndcg_policy_gate": bool(ndcg_gate),
+    }
+    uplift = {"phase_macro_f1": f1_uplift, "ndcg_at_10": ndcg_uplift}
+    return gates, uplift, branch
+
+
+def evaluate_processor_with_policy(run_dir: str | Path, cfg: RunConfig) -> dict[str, Any]:
     run_path = Path(run_dir).expanduser().resolve()
     artifacts = run_path / "artifacts"
     dataset_path = artifacts / "processor_training_rows.parquet"
@@ -2177,35 +2253,42 @@ def evaluate_processor(run_dir: str | Path, cfg: RunConfig) -> dict[str, Any]:
 
     base_slice = _evaluate_model_on_frame(frame=eval_frame, model_path=base_model_path, target_phase=target_phase)
     finetune_eval = _evaluate_model_on_frame(frame=eval_frame, model_path=finetune_model_path, target_phase=target_phase)
-
-    f1_uplift = float(finetune_eval.get("phase_macro_f1", 0.0) - base_slice.get("phase_macro_f1", 0.0))
-    ndcg_uplift = float(finetune_eval.get("ndcg_at_10", 0.0) - base_slice.get("ndcg_at_10", 0.0))
+    support_articles = int(eval_frame.get("article_key", pd.Series([], dtype=str)).astype(str).nunique()) if not eval_frame.empty else 0
+    gates, uplift, policy_branch = _policy_gate_payload(
+        cfg=cfg,
+        base_eval=base_eval,
+        base_slice=base_slice,
+        finetune_eval=finetune_eval,
+        slice_rows=int(len(eval_frame)),
+        support_articles=support_articles,
+    )
 
     payload = {
         "created_at": now_iso(),
         "target_phase": target_phase,
         "slice_rows": int(len(eval_frame)),
+        "support_articles": support_articles,
         "eval_source": eval_source,
         "eval_source_path": eval_source_path,
+        "gate_policy": str(cfg.finetune_gate_policy or "absolute_uplift"),
+        "gate_policy_branch": policy_branch,
+        "gate_policy_thresholds": {
+            "ceiling_threshold": float(cfg.finetune_ceiling_threshold or 0.95),
+            "min_slice_rows": int(cfg.finetune_min_slice_rows or 0),
+            "min_support_articles": int(cfg.finetune_min_support_articles or 0),
+        },
         "base": base_eval,
         "base_slice": base_slice,
         "finetune_slice": finetune_eval,
-        "uplift": {
-            "phase_macro_f1": f1_uplift,
-            "ndcg_at_10": ndcg_uplift,
-        },
-        "gates": {
-            "base_phase_macro_f1_ge_0_80": bool(base_eval.get("phase_macro_f1", 0.0) >= 0.80),
-            "base_ndcg_at_10_ge_0_75": bool(base_eval.get("ndcg_at_10", 0.0) >= 0.75),
-            "finetune_f1_uplift_ge_0_05": bool(f1_uplift >= 0.05),
-            "finetune_ndcg_uplift_ge_0_05": bool(ndcg_uplift >= 0.05),
-        },
+        "uplift": uplift,
+        "gates": gates,
     }
     payload["all_gates_pass"] = bool(all(payload["gates"].values()))
 
     base_out = artifacts / "processor_eval_base.json"
     finetune_out = artifacts / "processor_eval_finetune.json"
     combined_out = artifacts / "processor_eval_metrics.json"
+    explain_out = artifacts / "processor_gate_explain_v2.md"
 
     base_out.write_text(json.dumps(payload["base"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
     finetune_out.write_text(
@@ -2214,7 +2297,26 @@ def evaluate_processor(run_dir: str | Path, cfg: RunConfig) -> dict[str, Any]:
         encoding="utf-8",
     )
     combined_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    explain_out.write_text(
+        "\n".join(
+            [
+                "# Processor Gate Explain (v2)",
+                "",
+                f"- policy: `{payload['gate_policy']}`",
+                f"- branch: `{payload['gate_policy_branch']}`",
+                f"- slice_rows: `{payload['slice_rows']}`",
+                f"- support_articles: `{payload['support_articles']}`",
+                f"- all_gates_pass: `{payload['all_gates_pass']}`",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return payload
+
+
+def evaluate_processor(run_dir: str | Path, cfg: RunConfig) -> dict[str, Any]:
+    return evaluate_processor_with_policy(run_dir=run_dir, cfg=cfg)
 
 
 def train_universal_processor(dataset: ProcessorDataset, cfg: RunConfig) -> ProcessorModelRef:

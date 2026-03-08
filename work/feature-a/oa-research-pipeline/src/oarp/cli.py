@@ -23,7 +23,18 @@ from oarp.jobs import create_retry_job
 from oarp.knowledge import build_knowledge
 from oarp.models import ConsensusSet, ProcessorModelRef, RunConfig
 from oarp.pipeline import (
+    apply_vault_soft_supervision,
+    run_all_done_validation,
+    run_full_workflow,
+    run_pipeline,
+    validate_release_v1,
+    validate_v2_publish,
+)
+from oarp.pipeline import (
     audit_dual_graph as audit_dual_graph_api,
+)
+from oarp.pipeline import (
+    benchmark_vault_alignment as benchmark_vault_alignment_api,
 )
 from oarp.pipeline import (
     build_article_process_graph as build_article_process_graph_api,
@@ -38,16 +49,12 @@ from oarp.pipeline import (
     build_processing_dataset as build_processing_dataset_api,
 )
 from oarp.pipeline import evaluate_processor as evaluate_processor_api
+from oarp.pipeline import export_obsidian_vault as export_obsidian_vault_api
 from oarp.pipeline import finetune_nisi_sub200 as finetune_nisi_sub200_api
 from oarp.pipeline import (
     finetune_processor_for_system as finetune_processor_for_system_api,
 )
-from oarp.pipeline import (
-    run_all_done_validation,
-    run_full_workflow,
-    run_pipeline,
-    validate_release_v1,
-)
+from oarp.pipeline import import_obsidian_vault as import_obsidian_vault_api
 from oarp.pipeline import train_gnn_base as train_gnn_base_api
 from oarp.pipeline import train_tabular_head as train_tabular_head_api
 from oarp.pipeline import (
@@ -163,6 +170,38 @@ def _add_strict_workflow_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workflow-profile", default="strict_full")
 
 
+def _add_v2_storage_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--storage-root", default="/Volumes/Moon Seo/oarp_v2")
+    parser.add_argument("--run-root", default="")
+    parser.add_argument("--cache-root", default="")
+    parser.add_argument("--model-root", default="")
+    parser.add_argument("--dataset-root", default="")
+    parser.add_argument("--vault-root", default="")
+    parser.add_argument("--run-profile", choices=["", "v2_fast", "v2_strict", "v2_publish_1k"], default="")
+
+
+def _add_v2_runtime_hardening_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--tgi-port-policy", choices=["reuse_or_allocate", "fixed"], default="reuse_or_allocate")
+    parser.add_argument("--tgi-port-range", default="8080-8090")
+    parser.add_argument("--tgi-reuse-existing", dest="tgi_reuse_existing", action="store_true", default=True)
+    parser.add_argument("--no-tgi-reuse-existing", dest="tgi_reuse_existing", action="store_false")
+    parser.add_argument("--slm-max-chunks-per-doc", type=int, default=0)
+    parser.add_argument("--slm-max-doc-chars", type=int, default=0)
+    parser.add_argument("--slm-response-cache", choices=["on", "off"], default="on")
+    parser.add_argument("--extract-stage-timeout-sec", type=int, default=0)
+
+
+def _add_v2_finetune_policy_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--finetune-gate-policy",
+        choices=["absolute_uplift", "ceiling_aware", "non_degradation"],
+        default="absolute_uplift",
+    )
+    parser.add_argument("--finetune-ceiling-threshold", type=float, default=0.95)
+    parser.add_argument("--finetune-min-slice-rows", type=int, default=20)
+    parser.add_argument("--finetune-min-support-articles", type=int, default=5)
+
+
 def _add_v1_release_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--phase-schema-version", default="v1")
     parser.add_argument("--graph-core-mode", default="per_article_typed")
@@ -208,6 +247,30 @@ def _load_spec_from_run(run_dir: str | Path):
         raise ValueError("run state missing spec_path")
     spec = load_topic_spec(spec_path)
     return spec, state
+
+
+def _apply_run_profile_defaults(cfg: RunConfig) -> None:
+    profile = str(cfg.run_profile or "").strip().lower()
+    if not profile:
+        return
+    if profile in {"v2_fast", "v2_strict", "v2_publish_1k"}:
+        cfg.graph_architecture = "dual_concept"
+        cfg.extractor_mode = "slm_tgi_required"
+        cfg.vault_export_enabled = True
+        cfg.finetune_gate_policy = "ceiling_aware"
+    if profile == "v2_fast":
+        cfg.max_downloads = max(120, int(cfg.max_downloads))
+        cfg.slm_max_chunks_per_doc = max(0, int(cfg.slm_max_chunks_per_doc or 8))
+    if profile == "v2_strict":
+        cfg.strict_full_workflow = True
+        cfg.cpu_strict_profile = True
+    if profile == "v2_publish_1k":
+        cfg.strict_full_workflow = True
+        cfg.cpu_strict_profile = True
+        cfg.max_downloads = max(1000, int(cfg.max_downloads))
+        cfg.extract_workers = max(4, int(cfg.extract_workers))
+        cfg.acquire_workers = max(8, int(cfg.acquire_workers))
+        cfg.vault_import_enabled = True
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -264,6 +327,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--calibration-bins", type=int, default=10)
     _add_system_finetune_flags(p_run)
     _add_strict_workflow_flags(p_run)
+    _add_v2_storage_flags(p_run)
+    _add_v2_runtime_hardening_flags(p_run)
+    _add_v2_finetune_policy_flags(p_run)
     _add_mp_flags(p_run, include_enabled=True)
     _add_v1_release_flags(p_run)
     _add_dual_graph_flags(p_run)
@@ -327,6 +393,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run_full.add_argument("--emit-extraction-calibration", action="store_true")
     p_run_full.add_argument("--calibration-bins", type=int, default=10)
     _add_strict_workflow_flags(p_run_full)
+    _add_v2_storage_flags(p_run_full)
+    _add_v2_runtime_hardening_flags(p_run_full)
+    _add_v2_finetune_policy_flags(p_run_full)
     _add_mp_flags(p_run_full, include_enabled=True)
     _add_v1_release_flags(p_run_full)
     _add_dual_graph_flags(p_run_full)
@@ -396,6 +465,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_validate_all.add_argument("--emit-extraction-calibration", action="store_true")
     p_validate_all.add_argument("--calibration-bins", type=int, default=10)
     _add_strict_workflow_flags(p_validate_all)
+    _add_v2_storage_flags(p_validate_all)
+    _add_v2_runtime_hardening_flags(p_validate_all)
+    _add_v2_finetune_policy_flags(p_validate_all)
     _add_mp_flags(p_validate_all, include_enabled=True)
     _add_v1_release_flags(p_validate_all)
     _add_dual_graph_flags(p_validate_all)
@@ -465,9 +537,86 @@ def _build_parser() -> argparse.ArgumentParser:
     p_release_v1.add_argument("--emit-extraction-calibration", action="store_true")
     p_release_v1.add_argument("--calibration-bins", type=int, default=10)
     _add_strict_workflow_flags(p_release_v1)
+    _add_v2_storage_flags(p_release_v1)
+    _add_v2_runtime_hardening_flags(p_release_v1)
+    _add_v2_finetune_policy_flags(p_release_v1)
     _add_mp_flags(p_release_v1, include_enabled=True)
     _add_v1_release_flags(p_release_v1)
     _add_dual_graph_flags(p_release_v1)
+
+    p_release_v2 = sub.add_parser("validate-v2-publish", help="Run OARP v2 publish validation pack")
+    p_release_v2.add_argument("--spec", required=True)
+    p_release_v2.add_argument("--query", required=True)
+    p_release_v2.add_argument("--out", required=True)
+    p_release_v2.add_argument("--gold", required=True)
+    p_release_v2.add_argument("--shadow-gold", default="")
+    p_release_v2.add_argument("--gold-context", default="")
+    p_release_v2.add_argument("--vault-compare", dest="vault_compare", action="store_true", default=True)
+    p_release_v2.add_argument("--no-vault-compare", dest="vault_compare", action="store_false")
+    p_release_v2.add_argument("--precision-gate", type=float, default=0.80)
+    p_release_v2.add_argument("--context-completeness-gate", type=float, default=0.70)
+    p_release_v2.add_argument("--context-precision-gate", type=float, default=0.80)
+    p_release_v2.add_argument("--min-discovery-score", type=float, default=0.0)
+    p_release_v2.add_argument("--plugin", default="")
+    p_release_v2.add_argument("--max-pages-per-provider", type=int, default=60)
+    p_release_v2.add_argument("--max-discovered-records", type=int, default=100000)
+    p_release_v2.add_argument("--saturation-window-pages", type=int, default=8)
+    p_release_v2.add_argument("--saturation-min-yield", type=float, default=0.03)
+    p_release_v2.add_argument("--min-pages-before-saturation", type=int, default=20)
+    p_release_v2.add_argument("--resume-discovery", action="store_true")
+    p_release_v2.add_argument("--max-downloads", type=int, default=200)
+    p_release_v2.add_argument("--acquire-workers", type=int, default=8)
+    p_release_v2.add_argument("--extract-workers", type=int, default=4)
+    p_release_v2.add_argument("--english-first", dest="english_first", action="store_true", default=True)
+    p_release_v2.add_argument("--disable-english-first", dest="english_first", action="store_false")
+    p_release_v2.add_argument("--per-provider-cap", default="")
+    _add_local_repo_flags(p_release_v2)
+    p_release_v2.add_argument("--require-fulltext-mime", action="store_true")
+    p_release_v2.add_argument(
+        "--extractor-mode",
+        choices=["hybrid_rules", "slm_swarm", "slm_tgi_required"],
+        default="slm_tgi_required",
+    )
+    p_release_v2.add_argument("--extractor-models", default="")
+    p_release_v2.add_argument("--tgi-endpoint", default="")
+    p_release_v2.add_argument("--tgi-models", default="")
+    p_release_v2.add_argument("--tgi-workers", type=int, default=2)
+    p_release_v2.add_argument("--decoder", choices=["jsonschema"], default="jsonschema")
+    p_release_v2.add_argument("--slm-max-retries", type=int, default=2)
+    p_release_v2.add_argument("--slm-timeout-sec", type=float, default=20.0)
+    p_release_v2.add_argument("--slm-batch-size", type=int, default=8)
+    p_release_v2.add_argument("--slm-chunk-tokens", type=int, default=384)
+    p_release_v2.add_argument("--slm-overlap-tokens", type=int, default=96)
+    p_release_v2.add_argument("--schema-decoder", choices=["llguidance", "outlines"], default="llguidance")
+    p_release_v2.add_argument("--vote-policy", choices=["majority", "weighted"], default="weighted")
+    p_release_v2.add_argument("--min-vote-confidence", type=float, default=0.60)
+    p_release_v2.add_argument("--extractor-max-loop", type=int, default=2)
+    p_release_v2.add_argument("--processor-max-loop", type=int, default=2)
+    p_release_v2.add_argument("--gnn-hidden-dim", type=int, default=64)
+    p_release_v2.add_argument("--gnn-layers", type=int, default=2)
+    p_release_v2.add_argument("--gnn-dropout", type=float, default=0.1)
+    p_release_v2.add_argument("--gnn-epochs", type=int, default=80)
+    p_release_v2.add_argument("--gnn-lr", type=float, default=1e-3)
+    p_release_v2.add_argument("--tabular-model", default="xgboost")
+    p_release_v2.add_argument("--finetune-target-phase", default="NiSi")
+    p_release_v2.add_argument("--finetune-max-thickness-nm", type=float, default=200.0)
+    _add_system_finetune_flags(p_release_v2)
+    p_release_v2.add_argument("--require-context-fields", dest="require_context_fields", action="store_true", default=True)
+    p_release_v2.add_argument("--no-require-context-fields", dest="require_context_fields", action="store_false")
+    p_release_v2.add_argument("--context-window-lines", type=int, default=2)
+    p_release_v2.add_argument("--point-assembler", default="window-merge")
+    p_release_v2.add_argument("--context-assembler", default="sentence-window")
+    p_release_v2.add_argument("--emit-debug-ranking", action="store_true")
+    p_release_v2.add_argument("--emit-validation-metrics", action="store_true")
+    p_release_v2.add_argument("--emit-extraction-calibration", action="store_true")
+    p_release_v2.add_argument("--calibration-bins", type=int, default=10)
+    _add_strict_workflow_flags(p_release_v2)
+    _add_v2_storage_flags(p_release_v2)
+    _add_v2_runtime_hardening_flags(p_release_v2)
+    _add_v2_finetune_policy_flags(p_release_v2)
+    _add_mp_flags(p_release_v2, include_enabled=True)
+    _add_v1_release_flags(p_release_v2)
+    _add_dual_graph_flags(p_release_v2)
 
     p_discover = sub.add_parser("discover", help="Discover OA candidate articles")
     p_discover.add_argument("--spec", required=True)
@@ -524,6 +673,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_extract.add_argument("--schema-decoder", choices=["llguidance", "outlines"], default="llguidance")
     p_extract.add_argument("--vote-policy", choices=["majority", "weighted"], default="weighted")
     p_extract.add_argument("--min-vote-confidence", type=float, default=0.60)
+    _add_v2_runtime_hardening_flags(p_extract)
     p_extract.add_argument("--require-context-fields", dest="require_context_fields", action="store_true", default=True)
     p_extract.add_argument("--no-require-context-fields", dest="require_context_fields", action="store_false")
     p_extract.add_argument("--plugin", default="")
@@ -618,6 +768,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_graph_audit.add_argument("--run", required=True)
     _add_dual_graph_flags(p_graph_audit)
 
+    p_vault_export = sub.add_parser("vault-export", help="Export Obsidian vault from run artifacts")
+    p_vault_export.add_argument("--run", required=True)
+    p_vault_export.add_argument("--out", default="")
+    p_vault_export.add_argument("--profile", default="per_run_v1")
+    _add_v2_storage_flags(p_vault_export)
+
+    p_vault_import = sub.add_parser("vault-import", help="Import Obsidian vault links into run as soft supervision")
+    p_vault_import.add_argument("--vault", required=True)
+    p_vault_import.add_argument("--run", required=True)
+    p_vault_import.add_argument("--mode", choices=["soft_supervision"], default="soft_supervision")
+    _add_v2_storage_flags(p_vault_import)
+
+    p_vault_bench = sub.add_parser("vault-benchmark", help="Benchmark vault links against machine graph projection")
+    p_vault_bench.add_argument("--run", required=True)
+    p_vault_bench.add_argument("--vault", required=True)
+    _add_v2_storage_flags(p_vault_bench)
+
     p_recipe = sub.add_parser("recipe-generate", help="Generate recipe artifacts directly from a run")
     p_recipe.add_argument("--run", required=True)
     p_recipe.add_argument("--request-file", required=True)
@@ -671,12 +838,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ft2.add_argument("--max-thickness-nm", type=float, default=200.0)
     p_ft2.add_argument("--epochs", type=int, default=40)
     _add_system_finetune_flags(p_ft2)
+    _add_v2_finetune_policy_flags(p_ft2)
     _add_dual_graph_flags(p_ft2)
 
     p_eval = sub.add_parser("processor-eval", help="Evaluate base + fine-tuned processor models")
     p_eval.add_argument("--run", required=True)
     p_eval.add_argument("--suite", default="base_and_finetune")
     _add_system_finetune_flags(p_eval)
+    _add_v2_finetune_policy_flags(p_eval)
     _add_dual_graph_flags(p_eval)
 
     p_bench_extract = sub.add_parser("benchmark-extraction", help="Run extraction benchmark suites")
@@ -755,6 +924,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _cfg_from_args(args: argparse.Namespace, run_path: str | Path) -> RunConfig:
     cfg = RunConfig(run_dir=str(Path(run_path).expanduser().resolve()))
+    if hasattr(args, "storage_root"):
+        cfg.storage_root = str(args.storage_root or cfg.storage_root).strip() or cfg.storage_root
+    if hasattr(args, "run_root"):
+        cfg.run_root = str(args.run_root or "").strip()
+    if hasattr(args, "cache_root"):
+        cfg.cache_root = str(args.cache_root or "").strip()
+    if hasattr(args, "model_root"):
+        cfg.model_root = str(args.model_root or "").strip()
+    if hasattr(args, "dataset_root"):
+        cfg.dataset_root = str(args.dataset_root or "").strip()
+    if hasattr(args, "vault_root"):
+        cfg.vault_root = str(args.vault_root or "").strip()
+    if hasattr(args, "run_profile"):
+        cfg.run_profile = str(args.run_profile or "").strip()
     if hasattr(args, "min_discovery_score"):
         cfg.min_discovery_score = float(args.min_discovery_score)
     if hasattr(args, "plugin"):
@@ -867,6 +1050,14 @@ def _cfg_from_args(args: argparse.Namespace, run_path: str | Path) -> RunConfig:
         cfg.slm_chunk_tokens = max(64, int(args.slm_chunk_tokens))
     if hasattr(args, "slm_overlap_tokens"):
         cfg.slm_overlap_tokens = max(0, int(args.slm_overlap_tokens))
+    if hasattr(args, "slm_max_chunks_per_doc"):
+        cfg.slm_max_chunks_per_doc = max(0, int(args.slm_max_chunks_per_doc))
+    if hasattr(args, "slm_max_doc_chars"):
+        cfg.slm_max_doc_chars = max(0, int(args.slm_max_doc_chars))
+    if hasattr(args, "slm_response_cache"):
+        cfg.slm_response_cache = str(args.slm_response_cache or "on").strip().lower()
+    if hasattr(args, "extract_stage_timeout_sec"):
+        cfg.extract_stage_timeout_sec = max(0, int(args.extract_stage_timeout_sec))
     if hasattr(args, "slm_eval_split"):
         cfg.slm_eval_split = str(args.slm_eval_split or "all")
     if hasattr(args, "schema_decoder"):
@@ -957,6 +1148,12 @@ def _cfg_from_args(args: argparse.Namespace, run_path: str | Path) -> RunConfig:
         cfg.tgi_mode = str(args.tgi_mode or "docker").strip().lower()
     if hasattr(args, "tgi_port"):
         cfg.tgi_port = max(1, int(args.tgi_port))
+    if hasattr(args, "tgi_port_policy"):
+        cfg.tgi_port_policy = str(args.tgi_port_policy or "reuse_or_allocate").strip().lower()
+    if hasattr(args, "tgi_port_range"):
+        cfg.tgi_port_range = str(args.tgi_port_range or "8080-8090").strip() or "8080-8090"
+    if hasattr(args, "tgi_reuse_existing"):
+        cfg.tgi_reuse_existing = bool(args.tgi_reuse_existing)
     if hasattr(args, "tgi_health_path"):
         health = str(args.tgi_health_path or "/health").strip() or "/health"
         cfg.tgi_health_path = health if health.startswith("/") else f"/{health}"
@@ -975,6 +1172,16 @@ def _cfg_from_args(args: argparse.Namespace, run_path: str | Path) -> RunConfig:
         cfg.all_done_require_mp_if_key_present = bool(args.all_done_require_mp_if_key_present)
     if hasattr(args, "workflow_profile"):
         cfg.workflow_profile = str(args.workflow_profile or "strict_full").strip() or "strict_full"
+    if hasattr(args, "finetune_gate_policy"):
+        cfg.finetune_gate_policy = str(args.finetune_gate_policy or "absolute_uplift").strip().lower()
+    if hasattr(args, "finetune_ceiling_threshold"):
+        cfg.finetune_ceiling_threshold = max(0.0, min(1.0, float(args.finetune_ceiling_threshold)))
+    if hasattr(args, "finetune_min_slice_rows"):
+        cfg.finetune_min_slice_rows = max(1, int(args.finetune_min_slice_rows))
+    if hasattr(args, "finetune_min_support_articles"):
+        cfg.finetune_min_support_articles = max(1, int(args.finetune_min_support_articles))
+    if hasattr(args, "vault_compare"):
+        cfg.vault_import_enabled = bool(args.vault_compare)
     if hasattr(args, "out") and str(getattr(args, "command", "")).strip() in {
         "process-train-universal",
         "process-finetune-system",
@@ -982,6 +1189,7 @@ def _cfg_from_args(args: argparse.Namespace, run_path: str | Path) -> RunConfig:
         out_path = str(getattr(args, "out", "") or "").strip()
         if out_path:
             cfg.processor_model_dir = str(Path(out_path).expanduser().resolve())
+    _apply_run_profile_defaults(cfg)
     return cfg
 
 
@@ -1164,6 +1372,46 @@ def main(argv: list[str] | None = None) -> int:
         }
         result = validate_release_v1(
             run_dir=args.out,
+            cfg=cfg,
+            validation_cfg=validation_cfg,
+        )
+        _print_payload(
+            {
+                "status": "ok" if result.all_done_pass else "failed",
+                "all_done_pass": bool(result.all_done_pass),
+                "json_path": str(result.json_path),
+                "report_path": str(result.report_path),
+                "gate_map": result.gate_map,
+                "artifacts": result.artifact_map,
+                "repro_summary": result.repro_summary,
+                "remediation": result.remediation,
+            }
+        )
+        return 0 if result.all_done_pass else 1
+
+    if args.command == "validate-v2-publish":
+        cfg = _cfg_from_args(args, args.out)
+        cfg.run_profile = str(cfg.run_profile or "v2_publish_1k")
+        cfg.vault_export_enabled = True
+        cfg.vault_import_enabled = bool(args.vault_compare)
+        cfg.finetune_gate_policy = str(cfg.finetune_gate_policy or "ceiling_aware")
+        cfg.cpu_strict_profile = True if not bool(cfg.cpu_strict_profile) else cfg.cpu_strict_profile
+        cfg.cpu_probe = True if not bool(cfg.cpu_probe) else cfg.cpu_probe
+        reexec_code = _maybe_reexec_into_bootstrap_venv(raw_argv, cfg)
+        if reexec_code is not None:
+            return int(reexec_code)
+        validation_cfg = {
+            "gold_dir": str(args.gold),
+            "shadow_gold_dir": str(args.shadow_gold or "").strip(),
+            "gold_context_dir": str(args.gold_context or "").strip(),
+            "precision_gate": float(args.precision_gate),
+            "context_completeness_gate": float(args.context_completeness_gate),
+            "context_precision_gate": float(args.context_precision_gate),
+            "vault_compare": bool(args.vault_compare),
+        }
+        result = validate_v2_publish(
+            spec_path=args.spec,
+            query=args.query,
             cfg=cfg,
             validation_cfg=validation_cfg,
         )
@@ -1611,6 +1859,69 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         return 0 if result.ok else 1
+
+    if args.command == "vault-export":
+        cfg = _cfg_from_args(args, args.run)
+        cfg.vault_export_enabled = True
+        cfg.vault_profile = str(args.profile or "per_run_v1")
+        out_dir = str(args.out or "").strip()
+        if not out_dir:
+            out_dir = str(cfg.as_path() / "outputs" / "vault")
+        result = export_obsidian_vault_api(run_dir=str(cfg.as_path()), out_dir=out_dir, cfg=cfg)
+        _print_payload(
+            {
+                "status": "ok",
+                "vault_path": str(result.vault_path),
+                "index_path": str(result.index_path),
+                "note_counts_by_type": result.note_counts_by_type,
+                "link_count": int(result.link_count),
+                "warnings": result.warnings,
+            }
+        )
+        return 0
+
+    if args.command == "vault-import":
+        cfg = _cfg_from_args(args, args.run)
+        cfg.vault_import_enabled = True
+        cfg.vault_import_mode = str(args.mode or "soft_supervision")
+        result = import_obsidian_vault_api(vault_dir=args.vault, run_dir=str(cfg.as_path()), cfg=cfg)
+        supervision = apply_vault_soft_supervision(
+            run_dir=str(cfg.as_path()),
+            vault_links=result.link_deltas,
+            cfg=cfg,
+        )
+        _print_payload(
+            {
+                "status": "ok",
+                "parsed_links": int(len(result.parsed_links)),
+                "delta_links": int(len(result.link_deltas)),
+                "soft_constraints_path": str(result.soft_constraints_path),
+                "parsed_links_path": str(result.parsed_links_path),
+                "delta_path": str(result.delta_path),
+                "audit_path": str(result.audit_path),
+                "point_supervision_rows": int(len(supervision)),
+                "conflicts": result.conflicts,
+            }
+        )
+        return 0
+
+    if args.command == "vault-benchmark":
+        cfg = _cfg_from_args(args, args.run)
+        result = benchmark_vault_alignment_api(run_dir=str(cfg.as_path()), vault_dir=args.vault, cfg=cfg)
+        _print_payload(
+            {
+                "status": "ok",
+                "precision": result.precision,
+                "recall": result.recall,
+                "f1": result.f1,
+                "vault_coverage": result.vault_coverage,
+                "vault_link_density": result.vault_link_density,
+                "vault_import_delta_rate": result.vault_import_delta_rate,
+                "json_path": str(result.json_path),
+                "report_path": str(result.report_path),
+            }
+        )
+        return 0
 
     if args.command == "mp-enrich":
         cfg = _cfg_from_args(args, args.run)

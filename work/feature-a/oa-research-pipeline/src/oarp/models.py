@@ -10,6 +10,13 @@ import pandas as pd
 @dataclass
 class RunConfig:
     run_dir: str | Path
+    storage_root: str = "/Volumes/Moon Seo/oarp_v2"
+    run_root: str = ""
+    cache_root: str = ""
+    model_root: str = ""
+    dataset_root: str = ""
+    vault_root: str = ""
+    run_profile: str = ""
     python_exec: str = ""
     timeout_sec: int = 20
     max_per_provider: int = 25
@@ -61,6 +68,10 @@ class RunConfig:
     shared_cache_root: str = ""
     cache_read_only: bool = False
     cache_ttl_hours: int = 168
+    vault_export_enabled: bool = False
+    vault_import_enabled: bool = False
+    vault_import_mode: str = "soft_supervision"
+    vault_profile: str = "per_run_v1"
     cpu_strict_profile: bool = False
     cpu_max_threads: int = 4
     cpu_probe: bool = False
@@ -77,6 +88,10 @@ class RunConfig:
     slm_batch_size: int = 8
     slm_chunk_tokens: int = 384
     slm_overlap_tokens: int = 96
+    slm_max_chunks_per_doc: int = 0
+    slm_max_doc_chars: int = 0
+    slm_response_cache: str = "on"
+    extract_stage_timeout_sec: int = 0
     slm_eval_split: str = "all"
     schema_decoder: str = "llguidance"
     vote_policy: str = "weighted"
@@ -123,6 +138,9 @@ class RunConfig:
     tgi_platform: str = "auto"
     tgi_mode: str = "docker"
     tgi_port: int = 8080
+    tgi_port_policy: str = "reuse_or_allocate"
+    tgi_port_range: str = "8080-8090"
+    tgi_reuse_existing: bool = True
     tgi_health_path: str = "/health"
     tgi_generate_path: str = "/generate"
     workflow_profile: str = "strict_full"
@@ -131,6 +149,10 @@ class RunConfig:
     all_done_repro_runs: int = 2
     all_done_max_runtime_sec: int = 43200
     all_done_require_mp_if_key_present: bool = True
+    finetune_gate_policy: str = "absolute_uplift"
+    finetune_ceiling_threshold: float = 0.95
+    finetune_min_slice_rows: int = 20
+    finetune_min_support_articles: int = 5
     processor_model_dir: str = ""
 
     def as_path(self) -> Path:
@@ -268,6 +290,8 @@ class FullWorkflowResult:
     preflight_path: Path
     bootstrap_path: Path | None
     metrics_path: Path
+    vault_export_path: Path | None = None
+    vault_import_path: Path | None = None
 
 
 @dataclass
@@ -504,3 +528,46 @@ class ReleaseValidationResult:
     remediation: list[str]
     report_path: Path
     json_path: Path
+
+
+@dataclass
+class VaultExportResult:
+    vault_path: Path
+    note_counts_by_type: dict[str, int]
+    link_count: int
+    warnings: list[str]
+    index_path: Path
+
+
+@dataclass
+class VaultImportResult:
+    parsed_links: pd.DataFrame
+    link_deltas: pd.DataFrame
+    soft_constraints_path: Path
+    conflicts: list[str]
+    parsed_links_path: Path
+    delta_path: Path
+    audit_path: Path
+
+
+@dataclass
+class VaultBenchmarkResult:
+    precision: float
+    recall: float
+    f1: float
+    vault_coverage: float
+    vault_link_density: float
+    vault_import_delta_rate: float
+    report_path: Path
+    json_path: Path
+
+
+@dataclass
+class ProcessorEvalResultV2:
+    policy: str
+    base_metrics: dict[str, float]
+    slice_metrics: dict[str, dict[str, float]]
+    uplift: dict[str, float]
+    support_stats: dict[str, Any]
+    gate_map: dict[str, bool]
+    all_gates_pass: bool

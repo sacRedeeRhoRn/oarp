@@ -19,14 +19,20 @@ try:  # pragma: no cover - import failure depends on environment setup.
         MPEvidenceSet,
         PreflightReport,
         ProcessorDataset,
+        ProcessorEvalResultV2,
         ProcessorModelBundle,
         ProcessorModelRef,
         ReleaseValidationResult,
         RunConfig,
+        VaultBenchmarkResult,
+        VaultExportResult,
+        VaultImportResult,
     )
     from oarp.pipeline import (
         acquire_fulltext,  # noqa: F401
+        apply_vault_soft_supervision,  # noqa: F401
         audit_dual_graph,  # noqa: F401
+        benchmark_vault_alignment,  # noqa: F401
         build_article_phase_graph,  # noqa: F401
         build_article_process_graph,  # noqa: F401
         build_bridge_edges,  # noqa: F401
@@ -38,10 +44,13 @@ try:  # pragma: no cover - import failure depends on environment setup.
         enrich_with_materials_project,  # noqa: F401
         evaluate_extractor_quality,  # noqa: F401
         evaluate_processor,  # noqa: F401
+        evaluate_processor_with_policy,  # noqa: F401
+        export_obsidian_vault,  # noqa: F401
         extract_evidence,  # noqa: F401
         finetune_nisi_sub200,  # noqa: F401
         finetune_processor_for_system,  # noqa: F401
         generate_ranked_recipes,  # noqa: F401
+        import_obsidian_vault,  # noqa: F401
         prepare_feature_cache,  # noqa: F401
         render_outputs,  # noqa: F401
         run_all_done_validation,  # noqa: F401
@@ -57,6 +66,7 @@ try:  # pragma: no cover - import failure depends on environment setup.
         validate_evidence,  # noqa: F401
         validate_extraction_precision,  # noqa: F401
         validate_release_v1,  # noqa: F401
+        validate_v2_publish,  # noqa: F401
     )
     from oarp.service_api import (  # noqa: F401
         get_job_status,
@@ -89,6 +99,10 @@ try:  # pragma: no cover - import failure depends on environment setup.
             "discover_articles",
             "acquire_fulltext",
             "extract_evidence",
+            "export_obsidian_vault",
+            "import_obsidian_vault",
+            "apply_vault_soft_supervision",
+            "benchmark_vault_alignment",
             "enrich_with_materials_project",
             "validate_evidence",
             "validate_extraction_precision",
@@ -110,6 +124,7 @@ try:  # pragma: no cover - import failure depends on environment setup.
             "finetune_nisi_sub200",
             "finetune_processor_for_system",
             "evaluate_processor",
+            "evaluate_processor_with_policy",
             "generate_ranked_recipes",
             "MPEvidenceSet",
             "PreflightReport",
@@ -133,13 +148,18 @@ try:  # pragma: no cover - import failure depends on environment setup.
             "ProcessorDataset",
             "ProcessorModelRef",
             "ProcessorModelBundle",
+            "ProcessorEvalResultV2",
             "GraphBuildResult",
             "ArticleGraphBuildResult",
             "ConceptGraphBuildResult",
             "BridgeBuildResult",
             "GraphAuditResult",
+            "VaultExportResult",
+            "VaultImportResult",
+            "VaultBenchmarkResult",
             "prepare_feature_cache",
             "validate_release_v1",
+            "validate_v2_publish",
         ]
     )
 except Exception:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -36,6 +37,9 @@ from oarp.models import (
     RunConfig,
     RunResult,
     ValidatedEvidence,
+    VaultBenchmarkResult,
+    VaultExportResult,
+    VaultImportResult,
 )
 from oarp.runtime import (
     append_lineage,
@@ -56,6 +60,7 @@ from . import (
     extraction,
     knowledge,
     mp_enrichment,
+    obsidian_vault,
     processing,
     recipe,
     render,
@@ -69,6 +74,11 @@ def _run_id(topic_id: str, query: str) -> str:
     digest = hashlib.sha1(f"{topic_id}|{query}".encode("utf-8", errors="replace")).hexdigest()[:10]
     timestamp = now_iso().replace(":", "").replace("-", "")
     return f"run-{timestamp}-{digest}"
+
+
+def _safe_slug(value: Any) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip("-")
+    return token or "run"
 
 
 def _initialize_run_state(spec_path: str, spec: TopicSpec, query: str, cfg: RunConfig) -> None:
@@ -174,12 +184,34 @@ def _initialize_run_state(spec_path: str, spec: TopicSpec, query: str, cfg: RunC
             "tgi_port": cfg.tgi_port,
             "tgi_health_path": cfg.tgi_health_path,
             "tgi_generate_path": cfg.tgi_generate_path,
+            "tgi_port_policy": cfg.tgi_port_policy,
+            "tgi_port_range": cfg.tgi_port_range,
+            "tgi_reuse_existing": cfg.tgi_reuse_existing,
             "workflow_profile": cfg.workflow_profile,
+            "storage_root": cfg.storage_root,
+            "run_root": cfg.run_root,
+            "cache_root": cfg.cache_root,
+            "model_root": cfg.model_root,
+            "dataset_root": cfg.dataset_root,
+            "vault_root": cfg.vault_root,
+            "run_profile": cfg.run_profile,
+            "vault_export_enabled": cfg.vault_export_enabled,
+            "vault_import_enabled": cfg.vault_import_enabled,
+            "vault_import_mode": cfg.vault_import_mode,
+            "vault_profile": cfg.vault_profile,
+            "slm_max_chunks_per_doc": cfg.slm_max_chunks_per_doc,
+            "slm_max_doc_chars": cfg.slm_max_doc_chars,
+            "slm_response_cache": cfg.slm_response_cache,
+            "extract_stage_timeout_sec": cfg.extract_stage_timeout_sec,
             "use_bootstrapped_venv": cfg.use_bootstrapped_venv,
             "already_bootstrapped": cfg.already_bootstrapped,
             "all_done_repro_runs": cfg.all_done_repro_runs,
             "all_done_max_runtime_sec": cfg.all_done_max_runtime_sec,
             "all_done_require_mp_if_key_present": cfg.all_done_require_mp_if_key_present,
+            "finetune_gate_policy": cfg.finetune_gate_policy,
+            "finetune_ceiling_threshold": cfg.finetune_ceiling_threshold,
+            "finetune_min_slice_rows": cfg.finetune_min_slice_rows,
+            "finetune_min_support_articles": cfg.finetune_min_support_articles,
             "processor_model_dir": cfg.processor_model_dir,
         },
     }
@@ -479,6 +511,26 @@ def generate_ranked_recipes(request: Any, model_ref: ProcessorModelRef, kb: Any,
     return result
 
 
+def export_obsidian_vault(run_dir: str, out_dir: str, cfg: RunConfig) -> VaultExportResult:
+    return obsidian_vault.export_obsidian_vault(run_dir=run_dir, out_dir=out_dir, cfg=cfg)
+
+
+def import_obsidian_vault(vault_dir: str, run_dir: str, cfg: RunConfig) -> VaultImportResult:
+    return obsidian_vault.import_obsidian_vault(vault_dir=vault_dir, run_dir=run_dir, cfg=cfg)
+
+
+def apply_vault_soft_supervision(run_dir: str, vault_links: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
+    return obsidian_vault.apply_vault_soft_supervision(run_dir=run_dir, vault_links=vault_links, cfg=cfg)
+
+
+def benchmark_vault_alignment(run_dir: str, vault_dir: str, cfg: RunConfig) -> VaultBenchmarkResult:
+    return obsidian_vault.benchmark_vault_alignment(run_dir=run_dir, vault_dir=vault_dir, cfg=cfg)
+
+
+def evaluate_processor_with_policy(run_dir: str, cfg: RunConfig) -> dict[str, Any]:
+    return processing.evaluate_processor_with_policy(run_dir=run_dir, cfg=cfg)
+
+
 def run_pipeline(spec_path: str, query: str, cfg: RunConfig) -> RunResult:
     if bool(cfg.cpu_strict_profile):
         _apply_cpu_thread_clamps(cfg)
@@ -761,12 +813,34 @@ def run_pipeline(spec_path: str, query: str, cfg: RunConfig) -> RunResult:
             "tgi_port": cfg.tgi_port,
             "tgi_health_path": cfg.tgi_health_path,
             "tgi_generate_path": cfg.tgi_generate_path,
+            "tgi_port_policy": cfg.tgi_port_policy,
+            "tgi_port_range": cfg.tgi_port_range,
+            "tgi_reuse_existing": cfg.tgi_reuse_existing,
             "workflow_profile": cfg.workflow_profile,
+            "storage_root": cfg.storage_root,
+            "run_root": cfg.run_root,
+            "cache_root": cfg.cache_root,
+            "model_root": cfg.model_root,
+            "dataset_root": cfg.dataset_root,
+            "vault_root": cfg.vault_root,
+            "run_profile": cfg.run_profile,
+            "vault_export_enabled": cfg.vault_export_enabled,
+            "vault_import_enabled": cfg.vault_import_enabled,
+            "vault_import_mode": cfg.vault_import_mode,
+            "vault_profile": cfg.vault_profile,
+            "slm_max_chunks_per_doc": cfg.slm_max_chunks_per_doc,
+            "slm_max_doc_chars": cfg.slm_max_doc_chars,
+            "slm_response_cache": cfg.slm_response_cache,
+            "extract_stage_timeout_sec": cfg.extract_stage_timeout_sec,
             "use_bootstrapped_venv": cfg.use_bootstrapped_venv,
             "already_bootstrapped": cfg.already_bootstrapped,
             "all_done_repro_runs": cfg.all_done_repro_runs,
             "all_done_max_runtime_sec": cfg.all_done_max_runtime_sec,
             "all_done_require_mp_if_key_present": cfg.all_done_require_mp_if_key_present,
+            "finetune_gate_policy": cfg.finetune_gate_policy,
+            "finetune_ceiling_threshold": cfg.finetune_ceiling_threshold,
+            "finetune_min_slice_rows": cfg.finetune_min_slice_rows,
+            "finetune_min_support_articles": cfg.finetune_min_support_articles,
             "processor_model_dir": cfg.processor_model_dir,
         },
         "day3_summary": {
@@ -1096,6 +1170,8 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
 
     processor_models: dict[str, Path] = {}
     processor_eval: dict[str, Any] = {}
+    vault_export_path: Path | None = None
+    vault_import_path: Path | None = None
     processor_attempts = max(1, int(cfg.processor_max_loop))
     for attempt in range(1, processor_attempts + 1):
         started = time.perf_counter()
@@ -1137,6 +1213,50 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         if bool(cfg.strict_full_workflow):
             raise RuntimeError(f"strict processor gate failed after {processor_attempts} attempts: {processor_eval}")
 
+    if bool(cfg.vault_export_enabled) or str(cfg.run_profile or "").strip().lower().startswith("v2_"):
+        v0 = time.perf_counter()
+        preferred_root = str(cfg.vault_root or "").strip()
+        if preferred_root:
+            run_state = load_run_state(cfg.as_path())
+            run_id = str(run_state.get("run_id") or cfg.as_path().name).strip()
+            out_root = Path(preferred_root).expanduser().resolve() / _safe_slug(run_id)
+        else:
+            out_root = cfg.as_path() / "outputs" / "vault"
+        vault_export = export_obsidian_vault(run_dir=str(cfg.as_path()), out_dir=str(out_root), cfg=cfg)
+        vault_export_path = vault_export.vault_path
+        stage_rows.append(
+            _stage_row(
+                "vault_export",
+                v0,
+                time.perf_counter(),
+                {
+                    "vault_path": str(vault_export.vault_path),
+                    "note_counts": dict(vault_export.note_counts_by_type),
+                    "link_count": int(vault_export.link_count),
+                },
+            )
+        )
+        if bool(cfg.vault_import_enabled):
+            v1 = time.perf_counter()
+            vault_import = import_obsidian_vault(vault_dir=str(vault_export.vault_path), run_dir=str(cfg.as_path()), cfg=cfg)
+            vault_import_path = vault_import.soft_constraints_path
+            _ = apply_vault_soft_supervision(
+                run_dir=str(cfg.as_path()),
+                vault_links=vault_import.link_deltas,
+                cfg=cfg,
+            )
+            stage_rows.append(
+                _stage_row(
+                    "vault_import",
+                    v1,
+                    time.perf_counter(),
+                    {
+                        "soft_constraints_path": str(vault_import.soft_constraints_path),
+                        "delta_count": int(len(vault_import.link_deltas)),
+                    },
+                )
+            )
+
     articles_df = pd.read_parquet(run_result.articles_path) if run_result.articles_path.exists() else pd.DataFrame()
     documents_df = pd.read_parquet(run_result.documents_path) if run_result.documents_path.exists() else pd.DataFrame()
     provider_counts = (
@@ -1171,6 +1291,8 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         "gates": gate_status,
         "extractor_gate": extractor_gate,
         "processor_eval": processor_eval,
+        "vault_export_path": str(vault_export_path) if vault_export_path else "",
+        "vault_import_path": str(vault_import_path) if vault_import_path else "",
         "provider_counts": provider_counts,
         "document_provider_counts": doc_provider_counts,
         "stage_metrics_path": str(full_stage_path),
@@ -1180,6 +1302,7 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
             "preflight_report": str(preflight.report_path),
             "bootstrap_report": str(bootstrap_result.report_path) if bootstrap_result is not None else "",
             "processor_eval_metrics": str(artifacts / "processor_eval_metrics.json"),
+            "vault": str(vault_export_path) if vault_export_path else "",
         },
     }
     write_json(full_metrics_path, full_metrics)
@@ -1234,6 +1357,8 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         preflight_path=preflight.report_path,
         bootstrap_path=bootstrap_result.report_path if bootstrap_result is not None else None,
         metrics_path=full_metrics_path,
+        vault_export_path=vault_export_path,
+        vault_import_path=vault_import_path,
     )
 
 
@@ -1800,6 +1925,130 @@ def validate_release_v1(
         gate_map={str(k): bool(v) for k, v in gate_map.items()},
         artifact_map={str(k): str(v) for k, v in artifact_map.items()},
         repro_summary=repro_summary if isinstance(repro_summary, dict) else {},
+        remediation=remediation,
+        report_path=report_path,
+        json_path=json_path,
+    )
+
+
+def validate_v2_publish(
+    spec_path: str,
+    query: str,
+    cfg: RunConfig,
+    validation_cfg: dict[str, Any] | None = None,
+) -> ReleaseValidationResult:
+    validation_cfg = validation_cfg or {}
+    cfg.run_profile = str(cfg.run_profile or "v2_publish_1k")
+    cfg.vault_export_enabled = True
+    if str(cfg.finetune_gate_policy or "").strip().lower() in {"", "absolute_uplift"}:
+        cfg.finetune_gate_policy = "ceiling_aware"
+
+    all_done = run_all_done_validation(
+        spec_path=spec_path,
+        query=query,
+        cfg=cfg,
+        validation_cfg=validation_cfg,
+    )
+    run_path = cfg.as_path()
+    artifacts = run_path / "artifacts"
+
+    vault_root = run_path / "outputs" / "vault"
+    if str(cfg.vault_root or "").strip():
+        state = load_run_state(run_path)
+        run_id = str(state.get("run_id") or run_path.name)
+        vault_root = Path(cfg.vault_root).expanduser().resolve() / _safe_slug(run_id)
+    if not vault_root.exists():
+        export_obsidian_vault(run_dir=str(run_path), out_dir=str(vault_root), cfg=cfg)
+
+    compare_enabled = bool(validation_cfg.get("vault_compare", True))
+    vault_import_result: VaultImportResult | None = None
+    vault_bench: VaultBenchmarkResult | None = None
+    if compare_enabled:
+        vault_import_result = import_obsidian_vault(vault_dir=str(vault_root), run_dir=str(run_path), cfg=cfg)
+        _ = apply_vault_soft_supervision(run_dir=str(run_path), vault_links=vault_import_result.link_deltas, cfg=cfg)
+        vault_bench = benchmark_vault_alignment(run_dir=str(run_path), vault_dir=str(vault_root), cfg=cfg)
+
+    gate_map = dict(all_done.gates)
+    gate_map["vault_export_gate"] = bool(vault_root.exists())
+    gate_map["vault_import_gate"] = bool(vault_import_result is not None)
+    gate_map["vault_alignment_gate"] = bool((vault_bench is not None and vault_bench.f1 >= 0.50) or not compare_enabled)
+    gate_map["all_done_pass"] = bool(all(gate_map.values()))
+
+    artifact_map = dict(all_done.artifacts)
+    artifact_map.update(
+        {
+            "vault_root": str(vault_root),
+            "vault_export_manifest": str(artifacts / "vault_export_manifest.json"),
+            "vault_link_index": str(artifacts / "vault_link_index.parquet"),
+            "vault_links": str(artifacts / "vault_links.parquet"),
+            "vault_soft_constraints": str(artifacts / "vault_soft_constraints.parquet"),
+            "vault_import_audit": str(artifacts / "vault_import_audit.parquet"),
+            "vault_conflicts": str(artifacts / "vault_conflicts.parquet"),
+            "benchmark_vault_json": str(artifacts / "benchmark_vault.json"),
+            "benchmark_vault_md": str(artifacts / "benchmark_vault.md"),
+        }
+    )
+
+    remediation: list[str] = []
+    if not gate_map["vault_export_gate"]:
+        remediation.append("vault export missing: inspect outputs/vault generation stage.")
+    if compare_enabled and not gate_map["vault_import_gate"]:
+        remediation.append("vault import missing: check vault markdown parse or path permissions.")
+    if compare_enabled and not gate_map["vault_alignment_gate"]:
+        remediation.append("vault alignment below threshold: inspect benchmark_vault.md and link deltas.")
+    if not all_done.ok:
+        remediation.append("all_done gates failed: inspect all_done_validation.md for strict gate failures.")
+
+    payload = {
+        "created_at": now_iso(),
+        "run_dir": str(run_path),
+        "query": str(query),
+        "spec_path": str(Path(spec_path).expanduser().resolve()),
+        "gate_map": gate_map,
+        "artifact_map": artifact_map,
+        "benchmark_summary": all_done.benchmark_summary,
+        "vault_benchmark": {
+            "precision": float(vault_bench.precision) if vault_bench else 0.0,
+            "recall": float(vault_bench.recall) if vault_bench else 0.0,
+            "f1": float(vault_bench.f1) if vault_bench else 0.0,
+            "vault_coverage": float(vault_bench.vault_coverage) if vault_bench else 0.0,
+            "vault_link_density": float(vault_bench.vault_link_density) if vault_bench else 0.0,
+            "vault_import_delta_rate": float(vault_bench.vault_import_delta_rate) if vault_bench else 0.0,
+        },
+        "repro_summary": _safe_json(all_done.repro_compare_path),
+        "remediation": remediation,
+    }
+    json_path = artifacts / "publish_v2_validation.json"
+    report_path = artifacts / "publish_v2_validation.md"
+    write_json(json_path, payload)
+
+    lines = [
+        "# OARP v2 Publish Validation",
+        "",
+        f"- all_done_pass: `{gate_map['all_done_pass']}`",
+        f"- vault_export_gate: `{gate_map['vault_export_gate']}`",
+        f"- vault_import_gate: `{gate_map['vault_import_gate']}`",
+        f"- vault_alignment_gate: `{gate_map['vault_alignment_gate']}`",
+        "",
+        "## Machine Graph + Vault Graph Alignment",
+        f"- precision: `{payload['vault_benchmark']['precision']:.4f}`",
+        f"- recall: `{payload['vault_benchmark']['recall']:.4f}`",
+        f"- f1: `{payload['vault_benchmark']['f1']:.4f}`",
+        f"- vault_coverage: `{payload['vault_benchmark']['vault_coverage']:.4f}`",
+        f"- vault_link_density: `{payload['vault_benchmark']['vault_link_density']:.4f}`",
+        f"- vault_import_delta_rate: `{payload['vault_benchmark']['vault_import_delta_rate']:.4f}`",
+    ]
+    if remediation:
+        lines.extend(["", "## Remediation"])
+        for item in remediation:
+            lines.append(f"- {item}")
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    return ReleaseValidationResult(
+        all_done_pass=bool(gate_map["all_done_pass"]),
+        gate_map={str(k): bool(v) for k, v in gate_map.items()},
+        artifact_map={str(k): str(v) for k, v in artifact_map.items()},
+        repro_summary=_safe_json(all_done.repro_compare_path),
         remediation=remediation,
         report_path=report_path,
         json_path=json_path,
