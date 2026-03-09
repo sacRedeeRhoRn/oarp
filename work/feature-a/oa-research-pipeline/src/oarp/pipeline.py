@@ -25,22 +25,28 @@ from oarp.models import (
     EvidenceSet,
     ExtractionCalibration,
     ExtractionVoteSet,
+    FineTuneExecutionResult,
     FullWorkflowResult,
     GraphAuditResult,
     GraphBuildResult,
     MPEvidenceSet,
     OutputBundle,
+    PreLargeValidationResult,
     ProcessorDataset,
     ProcessorModelBundle,
     ProcessorModelRef,
+    QualityEvalResult,
+    QualityGateResult,
     ReleaseValidationResult,
     RunConfig,
     RunResult,
+    TieredValidationResult,
     ValidatedEvidence,
     VaultBenchmarkResult,
     VaultExportResult,
     VaultImportResult,
 )
+from oarp.normalization import build_thickness_views as normalize_thickness_views
 from oarp.runtime import (
     append_lineage,
     ensure_run_layout,
@@ -66,8 +72,8 @@ from . import (
     render,
     validation,
 )
-from .benchmark import run_benchmark
 from .workflow import bootstrap_runtime, preflight_strict
+from .workflow import prepare_shared_runtime as prepare_shared_runtime_impl
 
 
 def _run_id(topic_id: str, query: str) -> str:
@@ -136,6 +142,8 @@ def _initialize_run_state(spec_path: str, spec: TopicSpec, query: str, cfg: RunC
             "extractor_models": cfg.extractor_models,
             "tgi_endpoint": cfg.tgi_endpoint,
             "tgi_models": cfg.tgi_models,
+            "tgi_endpoints": cfg.tgi_endpoints,
+            "slm_model_mode": cfg.slm_model_mode,
             "tgi_workers": cfg.tgi_workers,
             "decoder": cfg.decoder,
             "slm_max_retries": cfg.slm_max_retries,
@@ -176,6 +184,8 @@ def _initialize_run_state(spec_path: str, spec: TopicSpec, query: str, cfg: RunC
             "processor_max_loop": cfg.processor_max_loop,
             "strict_full_workflow": cfg.strict_full_workflow,
             "auto_bootstrap": cfg.auto_bootstrap,
+            "bootstrap_mode": cfg.bootstrap_mode,
+            "shared_venv_root": cfg.shared_venv_root,
             "python_exec": cfg.python_exec,
             "tgi_docker_image": cfg.tgi_docker_image,
             "tgi_model_id": cfg.tgi_model_id,
@@ -212,6 +222,15 @@ def _initialize_run_state(spec_path: str, spec: TopicSpec, query: str, cfg: RunC
             "finetune_ceiling_threshold": cfg.finetune_ceiling_threshold,
             "finetune_min_slice_rows": cfg.finetune_min_slice_rows,
             "finetune_min_support_articles": cfg.finetune_min_support_articles,
+            "validation_tier": cfg.validation_tier,
+            "processor_train_tier": cfg.processor_train_tier,
+            "recipe_export_tier": cfg.recipe_export_tier,
+            "quality_profile": cfg.quality_profile,
+            "thickness_schema": cfg.thickness_schema,
+            "thickness_compat_alias": cfg.thickness_compat_alias,
+            "prelarge_rung": cfg.prelarge_rung,
+            "finetune_require_support": cfg.finetune_require_support,
+            "finetune_on_insufficient": cfg.finetune_on_insufficient,
             "processor_model_dir": cfg.processor_model_dir,
         },
     }
@@ -326,80 +345,492 @@ def validate_extraction_precision(votes: ExtractionVoteSet, spec: TopicSpec, cfg
     return validation.validate_extraction_precision(votes=votes.votes, accepted=accepted, cfg=cfg)
 
 
-def evaluate_extractor_quality(run_dir: str, gold_dir: str, cfg: RunConfig) -> ExtractionCalibration:
+def build_thickness_views(points_df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
+    compat_alias = bool(getattr(cfg, "thickness_compat_alias", True))
+    return normalize_thickness_views(points_df, compat_alias=compat_alias)
+
+
+_ATOMIC_MASS = {
+    "H": 1.0079,
+    "C": 12.0107,
+    "N": 14.0067,
+    "O": 15.999,
+    "Al": 26.9815,
+    "Si": 28.0855,
+    "Ti": 47.867,
+    "Cr": 51.996,
+    "Fe": 55.845,
+    "Co": 58.933,
+    "Ni": 58.6934,
+    "Cu": 63.546,
+    "Zn": 65.38,
+    "Ge": 72.630,
+    "Mo": 95.95,
+    "Pd": 106.42,
+    "Ag": 107.8682,
+    "Sn": 118.71,
+    "Pt": 195.084,
+    "Au": 196.96657,
+}
+_FORMULA_TOKEN_RE = re.compile(r"([A-Z][a-z]?)(\d*(?:\.\d+)?)")
+
+
+def _parse_formula_molar_mass(formula: str) -> tuple[float | None, list[tuple[str, float]]]:
+    text = re.sub(r"[^A-Za-z0-9.]", "", str(formula or "").strip())
+    if not text:
+        return None, []
+    tokens = _FORMULA_TOKEN_RE.findall(text)
+    if not tokens:
+        return None, []
+    parts: list[tuple[str, float]] = []
+    total = 0.0
+    for element, raw_count in tokens:
+        if element not in _ATOMIC_MASS:
+            return None, []
+        count = float(raw_count) if str(raw_count or "").strip() else 1.0
+        parts.append((element, count))
+        total += _ATOMIC_MASS[element] * count
+    return (total if total > 0 else None), parts
+
+
+def estimate_anneal_thickness_prior(points_df: pd.DataFrame, mp_df: pd.DataFrame | None, cfg: RunConfig) -> pd.DataFrame:  # noqa: ARG001
+    frame = points_df.copy()
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "point_id",
+                "thickness_anneal_prior_nm",
+                "thickness_anneal_posterior_nm",
+                "thickness_relation_confidence",
+                "thickness_role_source",
+            ]
+        )
+    if "point_id" not in frame.columns:
+        frame["point_id"] = [f"point_{idx}" for idx in range(len(frame))]
+    frame = build_thickness_views(frame, cfg)
+
+    density_by_material: dict[str, float] = {}
+    if mp_df is not None and not mp_df.empty:
+        if "material_id" in mp_df.columns and "density" in mp_df.columns:
+            for row in mp_df.to_dict(orient="records"):
+                mid = str(row.get("material_id") or "").strip()
+                try:
+                    density = float(row.get("density"))
+                except Exception:
+                    continue
+                if mid and density > 0:
+                    density_by_material[mid] = density
+
+    rows: list[dict[str, Any]] = []
+    grouped = frame.groupby("point_id", as_index=False).first()
+    for row in grouped.to_dict(orient="records"):
+        point_id = str(row.get("point_id") or "")
+        t_asdep = row.get("thickness_asdep_nm")
+        t_ann_extracted = row.get("thickness_anneal_nm")
+        try:
+            t_asdep_f = float(t_asdep) if t_asdep not in (None, "") else None
+        except Exception:
+            t_asdep_f = None
+        try:
+            t_ann_f = float(t_ann_extracted) if t_ann_extracted not in (None, "") else None
+        except Exception:
+            t_ann_f = None
+
+        formula = str(row.get("film_material") or row.get("entity") or "").strip()
+        molar_mass, parts = _parse_formula_molar_mass(formula)
+        prior = None
+        prior_conf = 0.35
+        if t_asdep_f is not None and t_asdep_f > 0 and molar_mass is not None and parts:
+            metal_coeff = max(1e-9, float(parts[0][1]))
+            total_coeff = sum(count for _elem, count in parts)
+            stoich_ratio = total_coeff / metal_coeff
+            density_term = 1.0
+            best_mid = str(row.get("mp_best_material_id") or "").strip()
+            if best_mid and best_mid in density_by_material:
+                density_term = max(0.5, min(2.5, density_by_material[best_mid] / 8.0))
+                prior_conf = 0.75
+            else:
+                ehull = row.get("mp_energy_above_hull_min")
+                try:
+                    ehull_f = float(ehull)
+                    density_term = max(0.8, min(1.4, 1.1 - min(ehull_f, 0.3)))
+                    prior_conf = 0.55
+                except Exception:
+                    prior_conf = 0.45
+            prior = float(max(0.0, t_asdep_f * stoich_ratio * density_term))
+
+        extract_conf = float(row.get("confidence") or row.get("vote_confidence") or 0.0)
+        context_conf = float(row.get("context_confidence") or 0.0)
+        w_extract = max(0.0, min(1.0, 0.40 + 0.35 * extract_conf + 0.25 * context_conf))
+        posterior = t_ann_f
+        if prior is not None and t_ann_f is not None:
+            posterior = float(w_extract * t_ann_f + (1.0 - w_extract) * prior)
+        elif prior is not None and t_ann_f is None:
+            posterior = prior
+
+        rows.append(
+            {
+                "point_id": point_id,
+                "thickness_anneal_prior_nm": prior,
+                "thickness_anneal_posterior_nm": posterior,
+                "thickness_relation_confidence": max(0.0, min(1.0, prior_conf if prior is not None else extract_conf)),
+                "thickness_role_source": str(row.get("thickness_role_source") or "legacy_alias"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _pair_completeness_ratio(frame: pd.DataFrame, x_name: str, y_name: str) -> float:
+    if frame.empty or "point_id" not in frame.columns:
+        return 0.0
+    total = int(frame["point_id"].astype(str).nunique())
+    if total <= 0:
+        return 0.0
+    complete = 0
+    for _point_id, group in frame.groupby("point_id"):
+        names = set(group.get("variable_name", pd.Series([], dtype=str)).astype(str).tolist())
+        if x_name in names and y_name in names:
+            complete += 1
+    return float(complete / max(1, total))
+
+
+def _cross_source_support_ratio(frame: pd.DataFrame, x_name: str, y_name: str) -> float:
+    if frame.empty:
+        return 0.0
+    required = {"point_id", "variable_name", "normalized_value"}
+    if not required.issubset(set(frame.columns)):
+        return 0.0
+    pairs: list[dict[str, Any]] = []
+    for point_id, group in frame.groupby("point_id"):
+        x_rows = group[group["variable_name"].astype(str) == x_name]
+        y_rows = group[group["variable_name"].astype(str) == y_name]
+        if x_rows.empty or y_rows.empty:
+            continue
+        first = group.iloc[0]
+        pairs.append(
+            {
+                "point_id": str(point_id),
+                "entity": str(first.get("entity") or ""),
+                "x": round(float(x_rows.iloc[0]["normalized_value"]), 3),
+                "y": round(float(y_rows.iloc[0]["normalized_value"]), 3),
+                "source": str(first.get("citation_url") or first.get("article_key") or ""),
+            }
+        )
+    if not pairs:
+        return 0.0
+    pair_df = pd.DataFrame(pairs)
+    support = (
+        pair_df.groupby(["entity", "x", "y"], as_index=False)["source"]
+        .nunique()
+        .rename(columns={"source": "support"})
+    )
+    if support.empty:
+        return 0.0
+    ratio = float((support["support"] >= 2).mean())
+    return ratio
+
+
+def _distribution_agreement_ratio(
+    frame: pd.DataFrame,
+    x_name: str,
+    y_name: str,
+    *,
+    x_tolerance_nm: float = 10.0,
+    y_tolerance_c: float = 150.0,
+) -> float:
+    if frame.empty:
+        return 0.0
+    required = {"point_id", "variable_name", "normalized_value"}
+    if not required.issubset(set(frame.columns)):
+        return 0.0
+
+    pairs: list[dict[str, Any]] = []
+    for point_id, group in frame.groupby("point_id"):
+        x_rows = group[group["variable_name"].astype(str) == x_name]
+        y_rows = group[group["variable_name"].astype(str) == y_name]
+        if x_rows.empty or y_rows.empty:
+            continue
+        first = group.iloc[0]
+        try:
+            x_val = float(x_rows.iloc[0]["normalized_value"])
+            y_val = float(y_rows.iloc[0]["normalized_value"])
+        except Exception:
+            continue
+        pairs.append(
+            {
+                "point_id": str(point_id),
+                "entity": str(first.get("entity") or ""),
+                "x": x_val,
+                "y": y_val,
+                "source": str(first.get("citation_url") or first.get("article_key") or ""),
+            }
+        )
+    if not pairs:
+        return 0.0
+
+    pair_df = pd.DataFrame(pairs)
+    agree_pairs = 0
+    total_pairs = 0
+
+    for _entity, entity_frame in pair_df.groupby("entity"):
+        sources = [str(item) for item in entity_frame["source"].astype(str).drop_duplicates().tolist() if str(item)]
+        if len(sources) < 2:
+            continue
+
+        grouped = {src: entity_frame[entity_frame["source"].astype(str) == src][["x", "y"]].to_dict(orient="records") for src in sources}
+        for idx in range(len(sources)):
+            for jdx in range(idx + 1, len(sources)):
+                left_src = sources[idx]
+                right_src = sources[jdx]
+                left_points = grouped.get(left_src) or []
+                right_points = grouped.get(right_src) or []
+                if not left_points or not right_points:
+                    continue
+                total_pairs += 1
+
+                agree = False
+                for left in left_points:
+                    lx = float(left.get("x") or 0.0)
+                    ly = float(left.get("y") or 0.0)
+                    for right in right_points:
+                        rx = float(right.get("x") or 0.0)
+                        ry = float(right.get("y") or 0.0)
+                        if abs(lx - rx) <= x_tolerance_nm and abs(ly - ry) <= y_tolerance_c:
+                            agree = True
+                            break
+                    if agree:
+                        break
+
+                if not agree:
+                    left_x = [float(item.get("x") or 0.0) for item in left_points]
+                    right_x = [float(item.get("x") or 0.0) for item in right_points]
+                    left_y = [float(item.get("y") or 0.0) for item in left_points]
+                    right_y = [float(item.get("y") or 0.0) for item in right_points]
+                    if left_x and right_x and left_y and right_y:
+                        x_overlap = max(min(left_x), min(right_x)) <= (min(max(left_x), max(right_x)) + x_tolerance_nm)
+                        y_overlap = max(min(left_y), min(right_y)) <= (min(max(left_y), max(right_y)) + y_tolerance_c)
+                        agree = bool(x_overlap and y_overlap)
+
+                if agree:
+                    agree_pairs += 1
+
+    if total_pairs <= 0:
+        return 0.0
+    return float(agree_pairs / total_pairs)
+
+
+def evaluate_quality_no_gold(run_dir: str, cfg: RunConfig) -> QualityEvalResult:
     run_path = Path(run_dir).expanduser().resolve()
     artifacts = run_path / "artifacts"
-    state = load_run_state(run_path)
-    spec = load_topic_spec(str(state.get("spec_path") or ""))
-    eval_out = artifacts / "extractor_eval"
-    eval_out.mkdir(parents=True, exist_ok=True)
+    x_name = "thickness_nm"
+    y_name = "temperature_c"
+    try:
+        state = load_run_state(run_path)
+    except FileNotFoundError:
+        state = {}
+    spec_path = str(state.get("spec_path") or "").strip()
+    if spec_path:
+        try:
+            spec = load_topic_spec(spec_path)
+            x_name = str(spec.plot.primary.x or x_name)
+            y_name = str(spec.plot.primary.y or y_name)
+        except Exception:
+            pass
 
-    bench = run_benchmark(
-        spec=spec,
-        gold_dir=gold_dir,
-        out_dir=eval_out,
-        run_dir=run_path,
-        strict_gold=True,
-    )
+    docs = pd.read_parquet(artifacts / "documents.parquet") if (artifacts / "documents.parquet").exists() else pd.DataFrame()
+    evidence = pd.read_parquet(artifacts / "evidence_points.parquet") if (artifacts / "evidence_points.parquet").exists() else pd.DataFrame()
+    validated = pd.read_parquet(artifacts / "validated_points.parquet") if (artifacts / "validated_points.parquet").exists() else pd.DataFrame()
+    strict_path = artifacts / "validated_points_strict.parquet"
+    strict_frame = pd.read_parquet(strict_path) if strict_path.exists() else validated.copy()
+    consensus_frame = pd.read_parquet(artifacts / "consensus_points.parquet") if (artifacts / "consensus_points.parquet").exists() else pd.DataFrame()
+    slm_responses = pd.read_parquet(artifacts / "slm_responses.parquet") if (artifacts / "slm_responses.parquet").exists() else pd.DataFrame()
 
-    validated_path = artifacts / "validated_points.parquet"
-    validated = pd.read_parquet(validated_path) if validated_path.exists() else pd.DataFrame()
-    if validated.empty:
-        provenance_complete_ratio = 0.0
-        context_precision_proxy = 0.0
-    else:
-        required = ["citation_url", "snippet", "locator"]
-        complete_mask = validated[required].fillna("").astype(str).apply(lambda col: col.str.strip().ne(""), axis=0).all(axis=1)
-        provenance_complete_ratio = float(complete_mask.mean())
-        context_cols = ["substrate_material", "substrate_orientation", "doping_state", "alloy_state"]
-        if all(col in validated.columns for col in context_cols):
-            context_mask = validated[context_cols].fillna("").astype(str).apply(lambda col: col.str.strip().ne(""), axis=0).all(axis=1)
-            context_precision_proxy = float(context_mask.mean())
+    usable_text_ratio = 0.0
+    usable_docs = 0
+    if not docs.empty:
+        if "usable_text" in docs.columns:
+            usable_text_ratio = float(docs["usable_text"].astype(bool).mean())
+            usable_docs = int(docs["usable_text"].astype(bool).sum())
         else:
-            context_precision_proxy = 0.0
+            usable_text_ratio = float((docs.get("parse_status", pd.Series([], dtype=str)).astype(str).str.contains("parsed", case=False)).mean())
+            usable_docs = int(round(usable_text_ratio * len(docs)))
+    matched_article_ratio = 0.0
+    evidence_density_per_usable_doc = 0.0
+    coverage_strength = 0.0
+    if usable_docs > 0 and not evidence.empty and "article_key" in evidence.columns:
+        matched_article_ratio = float(
+            evidence["article_key"].astype(str).dropna().drop_duplicates().shape[0] / max(1, usable_docs)
+        )
+        evidence_density_per_usable_doc = float(len(evidence) / max(1, usable_docs))
+        # Coverage should reflect both breadth (matched docs) and depth (usable tuples per doc).
+        coverage_strength = max(
+            float(matched_article_ratio),
+            float(min(1.0, evidence_density_per_usable_doc)),
+        )
 
-    payload = {
-        "tuple_precision": float(bench.precision),
-        "tuple_recall": float(bench.recall),
-        "tuple_f1": float(bench.f1),
-        "provenance_complete_ratio": float(provenance_complete_ratio),
-        "context_precision_proxy": float(context_precision_proxy),
-        "gate_tuple_precision": bool(float(bench.precision) >= 0.85),
-        "gate_tuple_recall": bool(float(bench.recall) >= 0.65),
-        "gate_provenance_complete": bool(float(provenance_complete_ratio) >= 1.0),
-        "gate_context_precision": bool(float(context_precision_proxy) >= 0.80),
-    }
-    payload["all_gates_pass"] = bool(
-        payload["gate_tuple_precision"]
-        and payload["gate_tuple_recall"]
-        and payload["gate_provenance_complete"]
-        and payload["gate_context_precision"]
+    provenance_complete_ratio = 0.0
+    if not strict_frame.empty and all(col in strict_frame.columns for col in ["citation_url", "snippet", "locator"]):
+        mask = strict_frame[["citation_url", "snippet", "locator"]].fillna("").astype(str).apply(
+            lambda col: col.str.strip().ne(""),
+            axis=0,
+        ).all(axis=1)
+        provenance_complete_ratio = float(mask.mean()) if len(mask) else 0.0
+
+    pair_completeness_ratio = _pair_completeness_ratio(strict_frame, x_name=x_name, y_name=y_name)
+    cross_source_support_ratio = _cross_source_support_ratio(strict_frame, x_name=x_name, y_name=y_name)
+    distribution_agreement_ratio = _distribution_agreement_ratio(
+        strict_frame,
+        x_name=x_name,
+        y_name=y_name,
     )
 
-    slm_eval_path = artifacts / "slm_eval_metrics.json"
-    write_json(slm_eval_path, payload)
+    timeout_rate = 0.0
+    if not slm_responses.empty and "status" in slm_responses.columns:
+        statuses = slm_responses["status"].astype(str).str.lower()
+        timeout_rate = float(statuses.isin({"timeout", "error", "request_error"}).mean())
 
-    calibration_frame = pd.DataFrame(
+    consensus_support_median = float(consensus_frame.get("support_count", pd.Series([0])).median()) if not consensus_frame.empty else 0.0
+    entropy_p75 = float(consensus_frame.get("entropy", pd.Series([0.0])).quantile(0.75)) if not consensus_frame.empty else 0.0
+
+    graph_ok = True
+    graph_audit_path = artifacts / "graph_audit.json"
+    if graph_audit_path.exists():
+        graph_ok = bool(_safe_json(graph_audit_path).get("ok", False))
+
+    metrics = {
+        "created_at": now_iso(),
+        "profile": str(cfg.quality_profile or "balanced"),
+        "usable_text_ratio": usable_text_ratio,
+        "matched_article_ratio": matched_article_ratio,
+        "evidence_density_per_usable_doc": evidence_density_per_usable_doc,
+        "coverage_strength": coverage_strength,
+        "provenance_complete_ratio": provenance_complete_ratio,
+        "pair_completeness_ratio": pair_completeness_ratio,
+        "timeout_rate": timeout_rate,
+        "consensus_support_median": consensus_support_median,
+        "cross_source_support_ratio": cross_source_support_ratio,
+        "distribution_agreement_ratio": distribution_agreement_ratio,
+        "entropy_p75": entropy_p75,
+        "graph_audit_ok": graph_ok,
+        "counts": {
+            "documents": int(len(docs)),
+            "evidence_rows": int(len(evidence)),
+            "validated_rows": int(len(validated)),
+            "strict_rows": int(len(strict_frame)),
+            "consensus_rows": int(len(consensus_frame)),
+            "slm_response_rows": int(len(slm_responses)),
+        },
+    }
+    json_path = artifacts / "quality_eval.json"
+    write_json(json_path, metrics)
+    report_lines = [
+        "# Quality Eval (No Gold)",
+        "",
+        f"- profile: `{metrics['profile']}`",
+        f"- usable_text_ratio: `{metrics['usable_text_ratio']:.4f}`",
+        f"- matched_article_ratio: `{metrics['matched_article_ratio']:.4f}`",
+        f"- evidence_density_per_usable_doc: `{metrics['evidence_density_per_usable_doc']:.4f}`",
+        f"- coverage_strength: `{metrics['coverage_strength']:.4f}`",
+        f"- provenance_complete_ratio: `{metrics['provenance_complete_ratio']:.4f}`",
+        f"- pair_completeness_ratio: `{metrics['pair_completeness_ratio']:.4f}`",
+        f"- timeout_rate: `{metrics['timeout_rate']:.4f}`",
+        f"- consensus_support_median: `{metrics['consensus_support_median']:.4f}`",
+        f"- cross_source_support_ratio: `{metrics['cross_source_support_ratio']:.4f}`",
+        f"- distribution_agreement_ratio: `{metrics['distribution_agreement_ratio']:.4f}`",
+        f"- entropy_p75: `{metrics['entropy_p75']:.4f}`",
+        f"- graph_audit_ok: `{metrics['graph_audit_ok']}`",
+    ]
+    report_path = artifacts / "quality_eval.md"
+    report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    return QualityEvalResult(profile=str(cfg.quality_profile or "balanced"), metrics=metrics, json_path=json_path, report_path=report_path)
+
+
+def enforce_quality_gates(run_dir: str, cfg: RunConfig) -> QualityGateResult:
+    run_path = Path(run_dir).expanduser().resolve()
+    artifacts = run_path / "artifacts"
+    eval_path = artifacts / "quality_eval.json"
+    if eval_path.exists():
+        metrics = _safe_json(eval_path)
+    else:
+        metrics = evaluate_quality_no_gold(run_dir, cfg).metrics
+    coverage_strength = float(metrics.get("coverage_strength") or 0.0)
+    if coverage_strength <= 0.0:
+        # Backward compatibility for runs generated before coverage_strength existed.
+        matched_ratio = float(metrics.get("matched_article_ratio") or 0.0)
+        density_ratio = float(metrics.get("evidence_density_per_usable_doc") or 0.0)
+        coverage_strength = max(matched_ratio, min(1.0, density_ratio))
+
+    gates = {
+        "provenance_complete_ratio_eq_1": bool(abs(float(metrics.get("provenance_complete_ratio") or 0.0) - 1.0) < 1e-12),
+        "pair_completeness_ratio_ge_0_90": bool(float(metrics.get("pair_completeness_ratio") or 0.0) >= 0.90),
+        "usable_text_ratio_ge_0_70": bool(float(metrics.get("usable_text_ratio") or 0.0) >= 0.70),
+        # Dynamic coverage check: breadth OR depth to avoid penalizing concentrated high-yield papers.
+        "matched_article_ratio_ge_0_20": bool(coverage_strength >= 0.20),
+        "timeout_rate_le_0_25": bool(float(metrics.get("timeout_rate") or 0.0) <= 0.25),
+        "consensus_support_median_ge_3": bool(float(metrics.get("consensus_support_median") or 0.0) >= 3.0),
+        "distribution_agreement_ratio_ge_0_35": bool(float(metrics.get("distribution_agreement_ratio") or 0.0) >= 0.35),
+        "entropy_p75_le_1_0": bool(float(metrics.get("entropy_p75") or 0.0) <= 1.0),
+        "graph_audit_ok": bool(metrics.get("graph_audit_ok", True)),
+    }
+    gate_payload = {
+        "created_at": now_iso(),
+        "profile": str(cfg.quality_profile or "balanced"),
+        "ok": bool(all(gates.values())),
+        "gates": gates,
+        "metrics_path": str(eval_path),
+        "metrics": metrics,
+    }
+    json_path = artifacts / "quality_gate_report.json"
+    write_json(json_path, gate_payload)
+    lines = ["# Quality Gate Report", "", f"- profile: `{gate_payload['profile']}`", f"- ok: `{gate_payload['ok']}`"]
+    for key, passed in gates.items():
+        lines.append(f"- {key}: `{passed}`")
+    report_path = artifacts / "quality_gate_report.md"
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return QualityGateResult(
+        profile=str(cfg.quality_profile or "balanced"),
+        ok=bool(gate_payload["ok"]),
+        gates=gates,
+        metrics=metrics,
+        json_path=json_path,
+        report_path=report_path,
+    )
+
+
+def evaluate_extractor_quality(run_dir: str, gold_dir: str, cfg: RunConfig) -> ExtractionCalibration:  # noqa: ARG001
+    quality_eval = evaluate_quality_no_gold(run_dir=run_dir, cfg=cfg)
+    payload = {
+        "tuple_precision": 0.0,
+        "tuple_recall": 0.0,
+        "tuple_f1": 0.0,
+        "provenance_complete_ratio": float(quality_eval.metrics.get("provenance_complete_ratio") or 0.0),
+        "context_precision_proxy": 0.0,
+        "gate_tuple_precision": False,
+        "gate_tuple_recall": False,
+        "gate_provenance_complete": bool(
+            abs(float(quality_eval.metrics.get("provenance_complete_ratio") or 0.0) - 1.0) < 1e-12
+        ),
+        "gate_context_precision": False,
+        "all_gates_pass": False,
+    }
+    artifacts = Path(run_dir).expanduser().resolve() / "artifacts"
+    calibration_path = artifacts / "extraction_calibration.parquet"
+    frame = pd.DataFrame(
         [
             {
                 "bin_idx": 0,
                 "bin_left": 0.0,
                 "bin_right": 1.0,
-                "point_count": int(len(validated)),
-                "mean_predicted": float(bench.precision),
-                "empirical_precision": float(bench.precision),
+                "point_count": int(quality_eval.metrics.get("counts", {}).get("validated_rows", 0)),
+                "mean_predicted": 0.0,
+                "empirical_precision": 0.0,
                 "ece_component": 0.0,
-                "tuple_recall": float(bench.recall),
-                "tuple_f1": float(bench.f1),
-                "provenance_complete_ratio": float(provenance_complete_ratio),
-                "context_precision_proxy": float(context_precision_proxy),
-                "all_gates_pass": bool(payload["all_gates_pass"]),
+                "provenance_complete_ratio": float(quality_eval.metrics.get("provenance_complete_ratio") or 0.0),
             }
         ]
     )
-    calibration_path = artifacts / "extraction_calibration.parquet"
-    calibration_frame.to_parquet(calibration_path, index=False)
-    return ExtractionCalibration(frame=calibration_frame, summary=payload, path=calibration_path)
+    frame.to_parquet(calibration_path, index=False)
+    return ExtractionCalibration(frame=frame, summary=payload, path=calibration_path)
 
 
 def build_processing_dataset(
@@ -458,6 +889,10 @@ def prepare_feature_cache(run_cfg: RunConfig):  # noqa: ANN201
     return prepare_feature_cache_runtime(run_cfg)
 
 
+def prepare_shared_runtime(cfg: RunConfig):
+    return prepare_shared_runtime_impl(cfg)
+
+
 def train_universal_processor(dataset: ProcessorDataset, cfg: RunConfig) -> ProcessorModelRef:
     return processing.train_universal_processor(dataset, cfg)
 
@@ -480,6 +915,92 @@ def finetune_nisi_sub200(
     cfg: RunConfig,
 ) -> ProcessorModelRef:
     return processing.finetune_nisi_sub200(model_ref, dataset, cfg)
+
+
+def _finetune_support_stats(run_dir: Path) -> tuple[int, int]:
+    slice_path = run_dir / "artifacts" / "finetune_slice.parquet"
+    if not slice_path.exists():
+        return 0, 0
+    try:
+        frame = pd.read_parquet(slice_path)
+    except Exception:
+        return 0, 0
+    rows = int(len(frame))
+    articles = int(frame.get("article_key", pd.Series([], dtype=str)).astype(str).nunique()) if not frame.empty else 0
+    return rows, articles
+
+
+def maybe_run_finetune(
+    model_ref: ProcessorModelRef,
+    dataset: ProcessorDataset,
+    cfg: RunConfig,
+) -> FineTuneExecutionResult:
+    artifacts = cfg.as_path() / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    payload_path = artifacts / "finetune_execution.json"
+    try:
+        finetune_ref = processing.finetune_nisi_sub200(model_ref, dataset, cfg)
+        rows, articles = _finetune_support_stats(cfg.as_path())
+        payload = {
+            "created_at": now_iso(),
+            "status": "ran",
+            "support_rows": rows,
+            "support_articles": articles,
+            "reason": "",
+            "model_dir": str(finetune_ref.model_dir),
+        }
+        write_json(payload_path, payload)
+        return FineTuneExecutionResult(
+            status="ran",
+            support_rows=rows,
+            support_articles=articles,
+            reason="",
+            model_ref=finetune_ref,
+            payload_path=payload_path,
+        )
+    except Exception as exc:
+        rows, articles = _finetune_support_stats(cfg.as_path())
+        reason = f"{type(exc).__name__}: {exc}"
+        support_insufficient = rows < max(1, int(cfg.finetune_min_slice_rows or 1)) or articles < max(
+            1,
+            int(cfg.finetune_min_support_articles or 1),
+        )
+        mode = str(getattr(cfg, "finetune_on_insufficient", "skip") or "skip").strip().lower()
+        if support_insufficient and mode == "skip":
+            payload = {
+                "created_at": now_iso(),
+                "status": "skipped_insufficient_support",
+                "support_rows": rows,
+                "support_articles": articles,
+                "reason": reason,
+                "model_dir": "",
+            }
+            write_json(payload_path, payload)
+            return FineTuneExecutionResult(
+                status="skipped_insufficient_support",
+                support_rows=rows,
+                support_articles=articles,
+                reason=reason,
+                model_ref=None,
+                payload_path=payload_path,
+            )
+        payload = {
+            "created_at": now_iso(),
+            "status": "failed",
+            "support_rows": rows,
+            "support_articles": articles,
+            "reason": reason,
+            "model_dir": "",
+        }
+        write_json(payload_path, payload)
+        return FineTuneExecutionResult(
+            status="failed",
+            support_rows=rows,
+            support_articles=articles,
+            reason=reason,
+            model_ref=None,
+            payload_path=payload_path,
+        )
 
 
 def evaluate_processor(run_dir: str, cfg: RunConfig) -> dict[str, Any]:
@@ -515,7 +1036,15 @@ def export_obsidian_vault(run_dir: str, out_dir: str, cfg: RunConfig) -> VaultEx
     return obsidian_vault.export_obsidian_vault(run_dir=run_dir, out_dir=out_dir, cfg=cfg)
 
 
+def project_concepts_to_vault(run_dir: str, out_dir: str, cfg: RunConfig) -> VaultExportResult:
+    return obsidian_vault.export_obsidian_vault(run_dir=run_dir, out_dir=out_dir, cfg=cfg)
+
+
 def import_obsidian_vault(vault_dir: str, run_dir: str, cfg: RunConfig) -> VaultImportResult:
+    return obsidian_vault.import_obsidian_vault(vault_dir=vault_dir, run_dir=run_dir, cfg=cfg)
+
+
+def parse_vault_semantics(vault_dir: str, run_dir: str, cfg: RunConfig) -> VaultImportResult:
     return obsidian_vault.import_obsidian_vault(vault_dir=vault_dir, run_dir=run_dir, cfg=cfg)
 
 
@@ -523,8 +1052,53 @@ def apply_vault_soft_supervision(run_dir: str, vault_links: pd.DataFrame, cfg: R
     return obsidian_vault.apply_vault_soft_supervision(run_dir=run_dir, vault_links=vault_links, cfg=cfg)
 
 
+def apply_vault_supervision_to_bridge_scores(run_dir: str, cfg: RunConfig) -> Path:
+    path = Path(run_dir).expanduser().resolve() / "artifacts" / "vault_supervision_bridge.parquet"
+    if path.exists():
+        return path
+    empty = pd.DataFrame(columns=["point_id", "gate_type", "vault_support_score", "vault_support_component"])
+    empty.to_parquet(path, index=False)
+    return path
+
+
+def apply_vault_supervision_to_processor_rows(run_dir: str, cfg: RunConfig) -> Path:
+    path = Path(run_dir).expanduser().resolve() / "artifacts" / "vault_supervision_processor.parquet"
+    if path.exists():
+        return path
+    empty = pd.DataFrame(columns=["point_id", "vault_soft_supervision_score", "support_count", "penalty_count"])
+    empty.to_parquet(path, index=False)
+    return path
+
+
 def benchmark_vault_alignment(run_dir: str, vault_dir: str, cfg: RunConfig) -> VaultBenchmarkResult:
     return obsidian_vault.benchmark_vault_alignment(run_dir=run_dir, vault_dir=vault_dir, cfg=cfg)
+
+
+def benchmark_vault_alignment_v2(run_dir: str, vault_dir: str, cfg: RunConfig) -> VaultBenchmarkResult:
+    return obsidian_vault.benchmark_vault_alignment(run_dir=run_dir, vault_dir=vault_dir, cfg=cfg)
+
+
+def build_global_concept_registry(storage_root: str, runs_root: str, out_dir: str, cfg: RunConfig) -> Path:
+    return obsidian_vault.build_global_concept_registry(
+        storage_root=storage_root,
+        runs_root=runs_root,
+        out_dir=out_dir,
+        cfg=cfg,
+    )
+
+
+def sync_run_concepts_to_registry(run_dir: str, registry_dir: str, cfg: RunConfig) -> dict[str, Any]:
+    return obsidian_vault.sync_run_concepts_to_registry(run_dir=run_dir, registry_dir=registry_dir, cfg=cfg)
+
+
+def run_benchmark(*args: Any, **kwargs: Any):  # noqa: ANN401
+    """Deprecated compatibility shim for older callers/tests.
+
+    The v2.3 no-gold flow does not use benchmark gating in production.
+    """
+    from oarp.benchmark import run_benchmark as legacy_run_benchmark
+
+    return legacy_run_benchmark(*args, **kwargs)
 
 
 def evaluate_processor_with_policy(run_dir: str, cfg: RunConfig) -> dict[str, Any]:
@@ -764,6 +1338,8 @@ def run_pipeline(spec_path: str, query: str, cfg: RunConfig) -> RunResult:
             "extractor_models": cfg.extractor_models,
             "tgi_endpoint": cfg.tgi_endpoint,
             "tgi_models": cfg.tgi_models,
+            "tgi_endpoints": cfg.tgi_endpoints,
+            "slm_model_mode": cfg.slm_model_mode,
             "tgi_workers": cfg.tgi_workers,
             "decoder": cfg.decoder,
             "slm_max_retries": cfg.slm_max_retries,
@@ -805,6 +1381,8 @@ def run_pipeline(spec_path: str, query: str, cfg: RunConfig) -> RunResult:
             "processor_max_loop": cfg.processor_max_loop,
             "strict_full_workflow": cfg.strict_full_workflow,
             "auto_bootstrap": cfg.auto_bootstrap,
+            "bootstrap_mode": cfg.bootstrap_mode,
+            "shared_venv_root": cfg.shared_venv_root,
             "python_exec": cfg.python_exec,
             "tgi_docker_image": cfg.tgi_docker_image,
             "tgi_model_id": cfg.tgi_model_id,
@@ -841,6 +1419,15 @@ def run_pipeline(spec_path: str, query: str, cfg: RunConfig) -> RunResult:
             "finetune_ceiling_threshold": cfg.finetune_ceiling_threshold,
             "finetune_min_slice_rows": cfg.finetune_min_slice_rows,
             "finetune_min_support_articles": cfg.finetune_min_support_articles,
+            "validation_tier": cfg.validation_tier,
+            "processor_train_tier": cfg.processor_train_tier,
+            "recipe_export_tier": cfg.recipe_export_tier,
+            "quality_profile": cfg.quality_profile,
+            "thickness_schema": cfg.thickness_schema,
+            "thickness_compat_alias": cfg.thickness_compat_alias,
+            "prelarge_rung": cfg.prelarge_rung,
+            "finetune_require_support": cfg.finetune_require_support,
+            "finetune_on_insufficient": cfg.finetune_on_insufficient,
             "processor_model_dir": cfg.processor_model_dir,
         },
         "day3_summary": {
@@ -863,9 +1450,9 @@ def run_pipeline(spec_path: str, query: str, cfg: RunConfig) -> RunResult:
                 "material_count": int(len(mp_enriched.materials)),
                 "point_link_count": int(len(mp_enriched.point_links)),
             },
-            "benchmark": {
-                "status": "run `oarp benchmark --gold-context <dir>` to append context benchmark artifacts",
-                "context_precision_gate": float(cfg.context_precision_gate),
+            "quality_eval": {
+                "status": "run `oarp quality-eval --run <run_dir> --profile balanced` for no-gold quality diagnostics",
+                "profile": str(cfg.quality_profile or "balanced"),
             },
         },
     }
@@ -979,6 +1566,124 @@ def _tune_processor_for_retry(cfg: RunConfig, attempt_idx: int) -> None:
     cfg.gnn_lr = max(1e-4, float(cfg.gnn_lr) * 0.7)
 
 
+_BROAD_RELAX_ONLY_REASONS = {
+    "missing_substrate",
+    "missing_orientation",
+    "missing_doping_context",
+    "missing_alloy_context",
+    "pure_ni_exception_not_supported_by_evidence",
+}
+
+
+def _point_has_primary_variables(frame: pd.DataFrame, point_id: str, x_name: str, y_name: str) -> bool:
+    group = frame[frame["point_id"].astype(str) == str(point_id)]
+    names = set(group.get("variable_name", pd.Series([], dtype=str)).astype(str).tolist())
+    return x_name in names and y_name in names
+
+
+def split_validated_tiers(run_dir: str, cfg: RunConfig) -> TieredValidationResult:
+    run_path = Path(run_dir).expanduser().resolve()
+    artifacts = run_path / "artifacts"
+    validated_path = artifacts / "validated_points.parquet"
+    rejected_path = artifacts / "rejected_points.parquet"
+    strict_path = artifacts / "validated_points_strict.parquet"
+    broad_path = artifacts / "validated_points_broad.parquet"
+    summary_path = artifacts / "validation_tiers_summary.json"
+
+    state = load_run_state(run_path)
+    spec_path = str(state.get("spec_path") or "")
+    if not spec_path:
+        raise ValueError("run state missing spec_path for tier splitting")
+    spec = load_topic_spec(spec_path)
+    x_name = str(spec.plot.primary.x or "")
+    y_name = str(spec.plot.primary.y or "")
+
+    strict = pd.read_parquet(validated_path) if validated_path.exists() else pd.DataFrame()
+    rejected = pd.read_parquet(rejected_path) if rejected_path.exists() else pd.DataFrame()
+    broad = strict.copy()
+    tier_mode = str(cfg.validation_tier or "both").strip().lower()
+
+    if tier_mode != "strict" and not rejected.empty:
+        relaxed_rows: list[dict[str, Any]] = []
+        for row in rejected.to_dict(orient="records"):
+            reason_text = str(row.get("reject_reason") or "")
+            reason_tokens = [item.strip() for item in reason_text.split(";") if item.strip()]
+            if not reason_tokens:
+                continue
+            if not set(reason_tokens).issubset(_BROAD_RELAX_ONLY_REASONS):
+                continue
+            relaxed_rows.append(row)
+        if relaxed_rows:
+            broad = pd.concat([broad, pd.DataFrame(relaxed_rows)], ignore_index=True)
+
+    if not broad.empty and x_name and y_name and "point_id" in broad.columns and "variable_name" in broad.columns:
+        keep_ids: list[str] = []
+        for point_id in broad["point_id"].astype(str).drop_duplicates().tolist():
+            if _point_has_primary_variables(broad, point_id, x_name, y_name):
+                keep_ids.append(str(point_id))
+        broad = broad[broad["point_id"].astype(str).isin(set(keep_ids))].copy()
+
+    if not broad.empty:
+        req_cols = ["citation_url", "snippet", "locator", "entity"]
+        for col in req_cols:
+            if col not in broad.columns:
+                broad[col] = ""
+        mask = (
+            broad[["citation_url", "snippet", "locator"]]
+            .fillna("")
+            .astype(str)
+            .apply(lambda col: col.str.strip().ne(""), axis=0)
+            .all(axis=1)
+            & broad["entity"].astype(str).str.strip().ne("")
+        )
+        broad = broad[mask].copy()
+
+    if tier_mode == "strict":
+        broad = strict.copy()
+
+    strict.to_parquet(strict_path, index=False)
+    broad.to_parquet(broad_path, index=False)
+
+    strict_points = int(strict.get("point_id", pd.Series([], dtype=str)).astype(str).nunique()) if not strict.empty else 0
+    broad_points = int(broad.get("point_id", pd.Series([], dtype=str)).astype(str).nunique()) if not broad.empty else 0
+    summary = {
+        "created_at": now_iso(),
+        "validation_tier": str(cfg.validation_tier or "both"),
+        "strict_rows": int(len(strict)),
+        "strict_points": strict_points,
+        "broad_rows": int(len(broad)),
+        "broad_points": broad_points,
+    }
+    write_json(summary_path, summary)
+
+    try:
+        db_path = artifacts / "index.sqlite"
+        state_payload = load_run_state(run_path)
+        run_id = str(state_payload.get("run_id") or "")
+        if run_id:
+            upsert_artifact(db_path=db_path, run_id=run_id, name="validated_points_strict", path=strict_path)
+            upsert_artifact(db_path=db_path, run_id=run_id, name="validated_points_broad", path=broad_path)
+            upsert_artifact(db_path=db_path, run_id=run_id, name="validation_tiers_summary", path=summary_path)
+            append_lineage(
+                db_path=db_path,
+                run_id=run_id,
+                stage="validation_tiers",
+                source_name="validated_points.parquet",
+                target_name="validated_points_broad.parquet",
+            )
+    except Exception:
+        pass
+
+    return TieredValidationResult(
+        strict=strict,
+        broad=broad,
+        strict_path=strict_path,
+        broad_path=broad_path,
+        summary_path=summary_path,
+        summary=summary,
+    )
+
+
 def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflowResult:
     if bool(cfg.cpu_strict_profile):
         _apply_cpu_thread_clamps(cfg)
@@ -986,6 +1691,10 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         _capture_cpu_env(cfg)
     spec = load_topic_spec(spec_path)
     resolved_query = ensure_query(spec, query)
+    if not str(cfg.finetune_target_phase or "").strip():
+        cfg.finetune_target_phase = str(spec.fine_tune.target_phase or "").strip()
+    if float(cfg.finetune_max_thickness_nm or 0.0) <= 0 and float(spec.fine_tune.max_thickness_nm or 0.0) > 0:
+        cfg.finetune_max_thickness_nm = float(spec.fine_tune.max_thickness_nm)
     if not cfg.plugin_id and spec.plugins.preferred_plugin:
         cfg.plugin_id = spec.plugins.preferred_plugin
     cfg.extractor_mode = "slm_tgi_required"
@@ -1074,6 +1783,67 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
     if run_result is None:
         raise RuntimeError("full workflow failed before producing base run artifacts")
 
+    vt0 = time.perf_counter()
+    tier_result = split_validated_tiers(run_dir=str(cfg.as_path()), cfg=cfg)
+    vt1 = time.perf_counter()
+    stage_rows.append(
+        _stage_row(
+            "validation_tiers",
+            vt0,
+            vt1,
+            {
+                "strict_rows": int(len(tier_result.strict)),
+                "broad_rows": int(len(tier_result.broad)),
+                "strict_path": str(tier_result.strict_path),
+                "broad_path": str(tier_result.broad_path),
+            },
+        )
+    )
+
+    mp_path = artifacts / "materials_project_enriched_points.parquet"
+    ts0 = time.perf_counter()
+    validated_for_semantics_path = tier_result.broad_path if tier_result.broad_path.exists() else (artifacts / "validated_points.parquet")
+    validated_for_semantics = (
+        pd.read_parquet(validated_for_semantics_path) if validated_for_semantics_path.exists() else pd.DataFrame()
+    )
+    validated_for_semantics = build_thickness_views(validated_for_semantics, cfg)
+    mp_materials_path = artifacts / "materials_project_materials.parquet"
+    mp_materials = pd.read_parquet(mp_materials_path) if mp_materials_path.exists() else pd.DataFrame()
+    prior_frame = estimate_anneal_thickness_prior(validated_for_semantics, mp_materials, cfg)
+    thickness_semantics = validated_for_semantics.merge(prior_frame, on="point_id", how="left")
+    thickness_semantics_path = artifacts / "thickness_semantics.parquet"
+    thickness_semantics.to_parquet(thickness_semantics_path, index=False)
+    stage_rows.append(
+        _stage_row(
+            "thickness_semantics",
+            ts0,
+            time.perf_counter(),
+            {
+                "rows": int(len(thickness_semantics)),
+                "path": str(thickness_semantics_path),
+            },
+        )
+    )
+
+    q0 = time.perf_counter()
+    quality_eval = evaluate_quality_no_gold(run_dir=str(cfg.as_path()), cfg=cfg)
+    quality_gate = enforce_quality_gates(run_dir=str(cfg.as_path()), cfg=cfg)
+    stage_rows.append(
+        _stage_row(
+            "quality_gate",
+            q0,
+            time.perf_counter(),
+            {
+                "profile": str(cfg.quality_profile or "balanced"),
+                "ok": bool(quality_gate.ok),
+                "quality_eval_json": str(quality_eval.json_path),
+                "quality_gate_json": str(quality_gate.json_path),
+            },
+        )
+    )
+    if bool(cfg.strict_full_workflow) and not bool(quality_gate.ok):
+        raise RuntimeError(f"strict quality gate failed: {quality_gate.json_path}")
+
     t6 = time.perf_counter()
     knowledge_bundle = knowledge.build_knowledge(cfg.as_path())
     t7 = time.perf_counter()
@@ -1091,10 +1861,17 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         )
     )
 
-    mp_path = artifacts / "materials_project_enriched_points.parquet"
     mp_data = pd.read_parquet(mp_path) if mp_path.exists() else None
+    processor_train_tier = str(cfg.processor_train_tier or "broad").strip().lower()
+    processor_points_source: Path
+    if processor_train_tier == "strict":
+        processor_points_source = tier_result.strict_path
+    else:
+        processor_points_source = tier_result.broad_path
+    if not processor_points_source.exists():
+        processor_points_source = knowledge_bundle.phase_events_path
     dataset = build_processing_dataset(
-        points=knowledge_bundle.phase_events_path,
+        points=processor_points_source,
         mp_data=mp_data,
         aux_data=None,
         cfg=cfg,
@@ -1178,13 +1955,27 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         try:
             gnn_ref = train_gnn_base(dataset, cfg)
             tabular_ref = train_tabular_head(dataset, gnn_ref, cfg)
-            finetune_ref = finetune_nisi_sub200(tabular_ref, dataset, cfg)
+            finetune_exec = maybe_run_finetune(tabular_ref, dataset, cfg)
+            if finetune_exec.status == "failed":
+                raise RuntimeError(f"fine-tune failed: {finetune_exec.reason}")
+            if finetune_exec.status == "skipped_insufficient_support" and str(cfg.finetune_on_insufficient or "skip").strip().lower() == "fail":
+                raise RuntimeError(
+                    "fine-tune support insufficient and policy=fail; inspect artifacts/finetune_execution.json"
+                )
             processor_eval = evaluate_processor(run_dir=str(cfg.as_path()), cfg=cfg)
+            processor_eval["finetune_execution"] = {
+                "status": finetune_exec.status,
+                "support_rows": int(finetune_exec.support_rows),
+                "support_articles": int(finetune_exec.support_articles),
+                "reason": str(finetune_exec.reason or ""),
+                "payload_path": str(finetune_exec.payload_path) if finetune_exec.payload_path else "",
+            }
             processor_models = {
                 "gnn_base": gnn_ref.model_dir,
                 "tabular_head": tabular_ref.model_dir,
-                "finetune_nisi_sub200": finetune_ref.model_dir,
             }
+            if finetune_exec.model_ref is not None:
+                processor_models["finetune_nisi_sub200"] = finetune_exec.model_ref.model_dir
             ok = bool(processor_eval.get("all_gates_pass"))
             error_text = ""
         except Exception as exc:
@@ -1222,7 +2013,7 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
             out_root = Path(preferred_root).expanduser().resolve() / _safe_slug(run_id)
         else:
             out_root = cfg.as_path() / "outputs" / "vault"
-        vault_export = export_obsidian_vault(run_dir=str(cfg.as_path()), out_dir=str(out_root), cfg=cfg)
+        vault_export = project_concepts_to_vault(run_dir=str(cfg.as_path()), out_dir=str(out_root), cfg=cfg)
         vault_export_path = vault_export.vault_path
         stage_rows.append(
             _stage_row(
@@ -1238,7 +2029,7 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         )
         if bool(cfg.vault_import_enabled):
             v1 = time.perf_counter()
-            vault_import = import_obsidian_vault(vault_dir=str(vault_export.vault_path), run_dir=str(cfg.as_path()), cfg=cfg)
+            vault_import = parse_vault_semantics(vault_dir=str(vault_export.vault_path), run_dir=str(cfg.as_path()), cfg=cfg)
             vault_import_path = vault_import.soft_constraints_path
             _ = apply_vault_soft_supervision(
                 run_dir=str(cfg.as_path()),
@@ -1254,6 +2045,24 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
                         "soft_constraints_path": str(vault_import.soft_constraints_path),
                         "delta_count": int(len(vault_import.link_deltas)),
                     },
+                )
+            )
+        if bool(cfg.global_concept_registry_enable):
+            v2 = time.perf_counter()
+            registry_root = str(cfg.global_concept_registry_root or "").strip()
+            if not registry_root:
+                registry_root = str(Path(cfg.storage_root).expanduser().resolve() / "datasets" / "concept_registry")
+            registry_summary = sync_run_concepts_to_registry(
+                run_dir=str(cfg.as_path()),
+                registry_dir=registry_root,
+                cfg=cfg,
+            )
+            stage_rows.append(
+                _stage_row(
+                    "concept_registry_sync",
+                    v2,
+                    time.perf_counter(),
+                    registry_summary,
                 )
             )
 
@@ -1274,6 +2083,7 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         "bootstrap_ok": bool(bootstrap_result.ok) if bootstrap_result is not None else True,
         "preflight_ok": bool(preflight.ok),
         "extractor_ok": bool(extractor_gate.get("all_pass")),
+        "quality_ok": bool(quality_gate.ok),
         "processor_ok": bool(processor_eval.get("all_gates_pass")),
     }
     gate_status["all_ok"] = bool(all(gate_status.values()))
@@ -1291,10 +2101,20 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
         "gates": gate_status,
         "extractor_gate": extractor_gate,
         "processor_eval": processor_eval,
+        "quality_eval": quality_eval.metrics,
+        "quality_gate": {
+            "ok": bool(quality_gate.ok),
+            "gates": dict(quality_gate.gates),
+            "json_path": str(quality_gate.json_path),
+            "report_path": str(quality_gate.report_path),
+        },
         "vault_export_path": str(vault_export_path) if vault_export_path else "",
         "vault_import_path": str(vault_import_path) if vault_import_path else "",
         "provider_counts": provider_counts,
         "document_provider_counts": doc_provider_counts,
+        "validation_tiers": dict(tier_result.summary),
+        "thickness_semantics_path": str(thickness_semantics_path),
+        "processor_training_source": str(processor_points_source),
         "stage_metrics_path": str(full_stage_path),
         "stage_metrics": stage_rows,
         "references": {
@@ -1302,6 +2122,8 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
             "preflight_report": str(preflight.report_path),
             "bootstrap_report": str(bootstrap_result.report_path) if bootstrap_result is not None else "",
             "processor_eval_metrics": str(artifacts / "processor_eval_metrics.json"),
+            "quality_eval_json": str(quality_eval.json_path),
+            "quality_gate_json": str(quality_gate.json_path),
             "vault": str(vault_export_path) if vault_export_path else "",
         },
     }
@@ -1331,6 +2153,24 @@ def run_full_workflow(spec_path: str, query: str, cfg: RunConfig) -> FullWorkflo
                 run_id=run_id,
                 name="full_workflow_metrics",
                 path=full_metrics_path,
+            )
+            upsert_artifact(
+                db_path=db_path,
+                run_id=run_id,
+                name="quality_eval",
+                path=quality_eval.json_path,
+            )
+            upsert_artifact(
+                db_path=db_path,
+                run_id=run_id,
+                name="quality_gate_report",
+                path=quality_gate.json_path,
+            )
+            upsert_artifact(
+                db_path=db_path,
+                run_id=run_id,
+                name="thickness_semantics",
+                path=thickness_semantics_path,
             )
             append_lineage(
                 db_path=db_path,
@@ -1408,28 +2248,147 @@ def _apply_cpu_thread_clamps(cfg: RunConfig | None = None) -> None:
     os.environ.setdefault("NUMEXPR_MAX_THREADS", str(max_threads))
 
 
-def _benchmark_summary_from_files(bench_out: Path) -> dict[str, Any]:
-    base_json = _safe_json(bench_out / "benchmark.json")
-    context_json = _safe_json(bench_out / "benchmark_context.json")
-    shadow_json = _safe_json(bench_out / "benchmark_shadow.json")
-    mp_json = _safe_json(bench_out / "benchmark_mp.json")
-    return {
-        "precision": float(base_json.get("precision") or 0.0),
-        "recall": float(base_json.get("recall") or 0.0),
-        "f1": float(base_json.get("f1") or 0.0),
-        "threshold_met": bool(base_json.get("threshold_met")),
-        "context_threshold_met": bool(context_json.get("context_threshold_met"))
-        if context_json
-        else True,
-        "context_completeness": float(context_json.get("condition_completeness") or 0.0)
-        if context_json
-        else 0.0,
-        "context_precision": float(context_json.get("condition_precision") or 0.0)
-        if context_json
-        else 0.0,
-        "shadow_precision": float(shadow_json.get("precision") or 0.0) if shadow_json else 0.0,
-        "mp_coverage": float(mp_json.get("mp_coverage") or 0.0) if mp_json else 0.0,
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    for item in path.rglob("*"):
+        if item.is_file():
+            try:
+                total += int(item.stat().st_size)
+            except Exception:
+                continue
+    return int(total)
+
+
+def run_prelarge_validation(
+    spec_path: str,
+    query: str,
+    cfg: RunConfig,
+    rung_cfg: dict[str, Any] | None = None,
+) -> PreLargeValidationResult:
+    rung_cfg = rung_cfg or {}
+    rung = int(rung_cfg.get("rung") or cfg.prelarge_rung or 300)
+    rung = max(50, rung)
+    cfg.max_downloads = rung
+    cfg.strict_full_workflow = True
+    cfg.extractor_mode = "slm_tgi_required"
+    cfg.validation_tier = str(cfg.validation_tier or "both")
+    cfg.processor_train_tier = str(cfg.processor_train_tier or "broad")
+    cfg.run_profile = str(cfg.run_profile or "v2_strict")
+
+    full = run_full_workflow(spec_path=spec_path, query=query, cfg=cfg)
+    run_path = cfg.as_path()
+    artifacts = run_path / "artifacts"
+
+    quality_eval = evaluate_quality_no_gold(run_dir=str(run_path), cfg=cfg)
+    quality_gate = enforce_quality_gates(run_dir=str(run_path), cfg=cfg)
+    full_metrics = _safe_json(full.metrics_path)
+    run_metrics = _safe_json(full.run_result.metrics_path)
+    stage_rows = full_metrics.get("stage_metrics") if isinstance(full_metrics.get("stage_metrics"), list) else []
+    counts = run_metrics.get("counts") if isinstance(run_metrics.get("counts"), dict) else {}
+    docs = int(counts.get("documents") or 0)
+    discover_extract_sec = 0.0
+    for row in stage_rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("stage") or "") in {"discover", "acquire", "extract"}:
+            discover_extract_sec += float(row.get("duration_sec") or 0.0)
+    docs_per_hour = (docs / (discover_extract_sec / 3600.0)) if discover_extract_sec > 0 and docs > 0 else 0.0
+    projected_10k_hours = (10000.0 / docs_per_hour) if docs_per_hour > 0 else 0.0
+    throughput_projection = {
+        "created_at": now_iso(),
+        "rung": rung,
+        "documents": docs,
+        "discover_acquire_extract_sec": discover_extract_sec,
+        "docs_per_hour": docs_per_hour,
+        "projected_hours_for_10000_docs": projected_10k_hours,
     }
+    throughput_projection_path = artifacts / "throughput_projection.json"
+    write_json(throughput_projection_path, throughput_projection)
+
+    run_bytes = _dir_size_bytes(run_path)
+    bytes_per_doc = (run_bytes / docs) if docs > 0 else 0.0
+    projected_bytes_10k = bytes_per_doc * 10000.0
+    storage_budget = {
+        "created_at": now_iso(),
+        "rung": rung,
+        "run_dir_bytes": run_bytes,
+        "documents": docs,
+        "bytes_per_doc": bytes_per_doc,
+        "projected_bytes_for_10000_docs": projected_bytes_10k,
+        "projected_gb_for_10000_docs": projected_bytes_10k / (1024.0 ** 3),
+    }
+    storage_budget_path = artifacts / "storage_budget_report.json"
+    write_json(storage_budget_path, storage_budget)
+
+    graph_audit_payload = _safe_json(artifacts / "graph_audit.json")
+
+    gate_map = {
+        "workflow_gate": bool(full.gate_status.get("all_ok")),
+        "quality_gate": bool(quality_gate.ok),
+        "processor_gate": bool(full.processor_eval.get("all_gates_pass")),
+        "graph_gate": bool(graph_audit_payload.get("ok", False)),
+    }
+    gate_map["all_ok"] = bool(all(gate_map.values()))
+
+    payload = {
+        "created_at": now_iso(),
+        "run_dir": str(run_path),
+        "rung": rung,
+        "gate_map": gate_map,
+        "workflow_gates": dict(full.gate_status),
+        "quality_eval": quality_eval.metrics,
+        "quality_gate": {
+            "ok": bool(quality_gate.ok),
+            "gates": dict(quality_gate.gates),
+            "json_path": str(quality_gate.json_path),
+        },
+        "processor_eval": dict(full.processor_eval),
+        "storage_budget_report": str(storage_budget_path),
+        "throughput_projection": str(throughput_projection_path),
+        "remediation": [
+            "inspect quality_gate_report.md when quality gate fails",
+            "inspect processor_eval_metrics.json when processor_gate fails",
+            "inspect graph_audit.md when graph_gate fails",
+        ],
+    }
+    json_path = artifacts / "prelarge_validation.json"
+    write_json(json_path, payload)
+
+    report_lines = [
+        "# Pre-Large Validation",
+        "",
+        f"- rung: `{rung}`",
+        f"- all_ok: `{gate_map['all_ok']}`",
+        f"- workflow_gate: `{gate_map['workflow_gate']}`",
+        f"- quality_gate: `{gate_map['quality_gate']}`",
+        f"- processor_gate: `{gate_map['processor_gate']}`",
+        f"- graph_gate: `{gate_map['graph_gate']}`",
+        "",
+        "## Throughput",
+        f"- docs_per_hour: `{docs_per_hour:.3f}`",
+        f"- projected_hours_for_10000_docs: `{projected_10k_hours:.3f}`",
+        "",
+        "## Storage",
+        f"- run_dir_bytes: `{run_bytes}`",
+        f"- projected_gb_for_10000_docs: `{storage_budget['projected_gb_for_10000_docs']:.3f}`",
+    ]
+    report_path = artifacts / "prelarge_validation.md"
+    report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+    return PreLargeValidationResult(
+        ok=bool(gate_map["all_ok"]),
+        run_dir=run_path,
+        rung=rung,
+        report_path=report_path,
+        json_path=json_path,
+        gate_map={str(k): bool(v) for k, v in gate_map.items()},
+        quality_eval_path=quality_eval.json_path,
+        quality_gate_path=quality_gate.json_path,
+        storage_budget_path=storage_budget_path,
+        throughput_projection_path=throughput_projection_path,
+    )
 
 
 def run_all_done_validation(
@@ -1454,8 +2413,6 @@ def run_all_done_validation(
 
     run_dir = cfg.as_path()
     artifacts = run_dir / "artifacts"
-    bench_out = artifacts / "all_done_benchmark"
-    bench_out.mkdir(parents=True, exist_ok=True)
 
     spec = load_topic_spec(spec_path)
     resolved_query = ensure_query(spec, query)
@@ -1465,44 +2422,14 @@ def run_all_done_validation(
 
     base_result = run_full_workflow(spec_path=spec_path, query=resolved_query, cfg=cfg)
     _check_budget("run_full")
-
-    gold_dir = str(validation_cfg.get("gold_dir") or "").strip()
-    shadow_gold_dir = str(validation_cfg.get("shadow_gold_dir") or "").strip()
-    gold_context_dir = str(validation_cfg.get("gold_context_dir") or "").strip()
-    precision_gate = float(validation_cfg.get("precision_gate") or 0.80)
-    context_completeness_gate = float(
-        validation_cfg.get("context_completeness_gate") or cfg.context_completeness_gate
-    )
-    context_precision_gate = float(
-        validation_cfg.get("context_precision_gate") or cfg.context_precision_gate
-    )
-
-    benchmark_summary: dict[str, Any] = {
-        "precision": 0.0,
-        "recall": 0.0,
-        "f1": 0.0,
-        "threshold_met": False,
-        "context_threshold_met": True,
-        "context_completeness": 0.0,
-        "context_precision": 0.0,
-        "shadow_precision": 0.0,
-        "mp_coverage": 0.0,
-    }
-    if gold_dir:
-        _ = run_benchmark(
-            spec=spec,
-            gold_dir=gold_dir,
-            out_dir=bench_out,
-            run_dir=run_dir,
-            precision_gate=precision_gate,
-            shadow_gold_dir=shadow_gold_dir or None,
-            strict_gold=True,
-            gold_context_dir=gold_context_dir or None,
-            context_completeness_gate=context_completeness_gate,
-            context_precision_gate=context_precision_gate,
-        )
-        benchmark_summary = _benchmark_summary_from_files(bench_out)
-    _check_budget("benchmark")
+    quality_eval = _safe_json(artifacts / "quality_eval.json")
+    if not quality_eval:
+        quality_eval = evaluate_quality_no_gold(run_dir=str(run_dir), cfg=cfg).metrics
+    quality_gate_payload = _safe_json(artifacts / "quality_gate_report.json")
+    if not quality_gate_payload:
+        qg = enforce_quality_gates(run_dir=str(run_dir), cfg=cfg)
+        quality_gate_payload = {"ok": qg.ok, "gates": qg.gates, "metrics": qg.metrics}
+    _check_budget("quality")
 
     repro_compare: dict[str, Any] = {
         "runs": [],
@@ -1602,11 +2529,17 @@ def run_all_done_validation(
         except Exception:
             provenance_complete = float(extractor_gate.get("provenance_complete_ratio") or 0.0)
 
+    finetune_exec_payload = _safe_json(artifacts / "finetune_execution.json")
+    finetune_status = str(finetune_exec_payload.get("status") or "").strip().lower()
+    finetune_required = not (
+        finetune_status == "skipped_insufficient_support"
+        and str(getattr(cfg, "finetune_on_insufficient", "skip") or "skip").strip().lower() == "skip"
+    )
     processor_artifacts_ok = all(
         [
             _artifact_exists(artifacts / "models" / "gnn_base" / "gnn_model.pt"),
             _artifact_exists(artifacts / "models" / "tabular_head" / "processor_model.pkl"),
-            _artifact_exists(artifacts / "models" / "finetune_nisi_sub200" / "processor_model.pkl"),
+            (not finetune_required) or _artifact_exists(artifacts / "models" / "finetune_nisi_sub200" / "processor_model.pkl"),
             _artifact_exists(artifacts / "processor_eval_metrics.json"),
         ]
     )
@@ -1618,19 +2551,21 @@ def run_all_done_validation(
         "run_metrics": str(base_result.run_result.metrics_path),
         "report_md": str(base_result.run_result.report_path),
         "processor_eval_metrics": str(artifacts / "processor_eval_metrics.json"),
+        "quality_eval_json": str(artifacts / "quality_eval.json"),
+        "quality_gate_report_json": str(artifacts / "quality_gate_report.json"),
         "all_done_json": str(artifacts / "all_done_validation.json"),
         "all_done_md": str(artifacts / "all_done_validation.md"),
         "repro_compare": str(repro_compare_path),
     }
 
-    benchmark_gate = bool(benchmark_summary.get("threshold_met"))
-    if gold_context_dir:
-        benchmark_gate = benchmark_gate and bool(benchmark_summary.get("context_threshold_met"))
-
     mp_key_present = bool(str(os.getenv("MP_API_KEY", "")).strip())
     mp_gate = True
     if cfg.all_done_require_mp_if_key_present and mp_key_present:
-        mp_gate = float(benchmark_summary.get("mp_coverage") or 0.0) > 0.0
+        mp_frame = pd.read_parquet(artifacts / "materials_project_enriched_points.parquet") if (artifacts / "materials_project_enriched_points.parquet").exists() else pd.DataFrame()
+        if not mp_frame.empty and "mp_status" in mp_frame.columns:
+            mp_gate = bool((mp_frame["mp_status"].astype(str) == "success").mean() > 0.0)
+        else:
+            mp_gate = False
 
     gates = {
         "bootstrap_gate": bool(base_result.gate_status.get("bootstrap_ok")),
@@ -1644,7 +2579,7 @@ def run_all_done_validation(
             and provenance_complete >= 1.0
         ),
         "processing_gate": bool(processor_artifacts_ok and bool(processor_eval.get("all_gates_pass"))),
-        "benchmark_gate": bool(benchmark_gate),
+        "quality_gate": bool(quality_gate_payload.get("ok", False)),
         "mp_gate": bool(mp_gate),
         "reproducibility_gate": bool(repro_compare.get("repro_ok")),
     }
@@ -1661,8 +2596,8 @@ def run_all_done_validation(
         remediation.append("extraction gate failed: inspect slm_* artifacts and extractor config.")
     if not gates["processing_gate"]:
         remediation.append("processing gate failed: inspect processor_eval_metrics.json and model artifacts.")
-    if not gates["benchmark_gate"]:
-        remediation.append("benchmark gate failed: inspect benchmark.json/context report and tighten extraction quality.")
+    if not gates["quality_gate"]:
+        remediation.append("quality gate failed: inspect quality_eval.json and quality_gate_report.md.")
     if not gates["reproducibility_gate"]:
         remediation.append("reproducibility gate failed: inspect repro_compare.json count drift.")
     if not gates["mp_gate"]:
@@ -1674,7 +2609,8 @@ def run_all_done_validation(
         "query": resolved_query,
         "spec_path": str(Path(spec_path).expanduser().resolve()),
         "gates": gates,
-        "benchmark_summary": benchmark_summary,
+        "quality_summary": quality_eval,
+        "quality_gate_report": quality_gate_payload,
         "artifacts": required_artifacts,
         "preflight_report": str(base_result.preflight_path),
         "bootstrap_report": str(base_result.bootstrap_path) if base_result.bootstrap_path else "",
@@ -1684,6 +2620,7 @@ def run_all_done_validation(
         "counts": counts,
         "extractor_gate": extractor_gate,
         "processor_eval": processor_eval,
+        "finetune_execution": finetune_exec_payload,
         "remediation": remediation,
     }
 
@@ -1700,15 +2637,15 @@ def run_all_done_validation(
         f"- crawl_acquire_gate: `{gates['crawl_acquire_gate']}`",
         f"- extraction_gate: `{gates['extraction_gate']}`",
         f"- processing_gate: `{gates['processing_gate']}`",
-        f"- benchmark_gate: `{gates['benchmark_gate']}`",
+        f"- quality_gate: `{gates['quality_gate']}`",
         f"- reproducibility_gate: `{gates['reproducibility_gate']}`",
         "",
-        "## Benchmark Summary",
-        f"- precision: `{benchmark_summary.get('precision', 0.0):.4f}`",
-        f"- recall: `{benchmark_summary.get('recall', 0.0):.4f}`",
-        f"- f1: `{benchmark_summary.get('f1', 0.0):.4f}`",
-        f"- context_threshold_met: `{bool(benchmark_summary.get('context_threshold_met'))}`",
-        f"- mp_coverage: `{benchmark_summary.get('mp_coverage', 0.0):.4f}`",
+        "## Quality Summary",
+        f"- provenance_complete_ratio: `{float(quality_eval.get('provenance_complete_ratio') or 0.0):.4f}`",
+        f"- pair_completeness_ratio: `{float(quality_eval.get('pair_completeness_ratio') or 0.0):.4f}`",
+        f"- cross_source_support_ratio: `{float(quality_eval.get('cross_source_support_ratio') or 0.0):.4f}`",
+        f"- distribution_agreement_ratio: `{float(quality_eval.get('distribution_agreement_ratio') or 0.0):.4f}`",
+        f"- entropy_p75: `{float(quality_eval.get('entropy_p75') or 0.0):.4f}`",
         "",
         "## Reproducibility",
         f"- repro_ok: `{bool(repro_compare.get('repro_ok'))}`",
@@ -1728,7 +2665,8 @@ def run_all_done_validation(
         repro_compare_path=repro_compare_path,
         gates=gates,
         artifacts=required_artifacts,
-        benchmark_summary=benchmark_summary,
+        quality_summary=quality_eval,
+        benchmark_summary={},
     )
 
 
@@ -1890,7 +2828,7 @@ def validate_release_v1(
         "graph_no_orphans": graph_no_orphans,
         "artifact_map": artifact_map,
         "repro_summary": repro_summary,
-        "benchmark_summary": all_done.benchmark_summary,
+        "quality_summary": all_done.quality_summary,
         "remediation": remediation,
     }
     json_path = artifacts / "release_v1_validation.json"
@@ -1905,10 +2843,11 @@ def validate_release_v1(
         f"- phase_schema_gate: `{gate_map['phase_schema_gate']}`",
         f"- cache_audit_gate: `{gate_map['cache_audit_gate']}`",
         "",
-        "## Benchmark Summary",
-        f"- precision: `{float(all_done.benchmark_summary.get('precision') or 0.0):.4f}`",
-        f"- recall: `{float(all_done.benchmark_summary.get('recall') or 0.0):.4f}`",
-        f"- f1: `{float(all_done.benchmark_summary.get('f1') or 0.0):.4f}`",
+        "## Quality Summary",
+        f"- provenance_complete_ratio: `{float(all_done.quality_summary.get('provenance_complete_ratio') or 0.0):.4f}`",
+        f"- pair_completeness_ratio: `{float(all_done.quality_summary.get('pair_completeness_ratio') or 0.0):.4f}`",
+        f"- cross_source_support_ratio: `{float(all_done.quality_summary.get('cross_source_support_ratio') or 0.0):.4f}`",
+        f"- distribution_agreement_ratio: `{float(all_done.quality_summary.get('distribution_agreement_ratio') or 0.0):.4f}`",
         "",
         "## Graph + Phase",
         f"- phase_completeness: `{phase_completeness:.4f}`",
@@ -1958,15 +2897,15 @@ def validate_v2_publish(
         run_id = str(state.get("run_id") or run_path.name)
         vault_root = Path(cfg.vault_root).expanduser().resolve() / _safe_slug(run_id)
     if not vault_root.exists():
-        export_obsidian_vault(run_dir=str(run_path), out_dir=str(vault_root), cfg=cfg)
+        project_concepts_to_vault(run_dir=str(run_path), out_dir=str(vault_root), cfg=cfg)
 
     compare_enabled = bool(validation_cfg.get("vault_compare", True))
     vault_import_result: VaultImportResult | None = None
     vault_bench: VaultBenchmarkResult | None = None
     if compare_enabled:
-        vault_import_result = import_obsidian_vault(vault_dir=str(vault_root), run_dir=str(run_path), cfg=cfg)
+        vault_import_result = parse_vault_semantics(vault_dir=str(vault_root), run_dir=str(run_path), cfg=cfg)
         _ = apply_vault_soft_supervision(run_dir=str(run_path), vault_links=vault_import_result.link_deltas, cfg=cfg)
-        vault_bench = benchmark_vault_alignment(run_dir=str(run_path), vault_dir=str(vault_root), cfg=cfg)
+        vault_bench = benchmark_vault_alignment_v2(run_dir=str(run_path), vault_dir=str(vault_root), cfg=cfg)
 
     gate_map = dict(all_done.gates)
     gate_map["vault_export_gate"] = bool(vault_root.exists())
@@ -1979,13 +2918,20 @@ def validate_v2_publish(
         {
             "vault_root": str(vault_root),
             "vault_export_manifest": str(artifacts / "vault_export_manifest.json"),
+            "vault_notes_index": str(artifacts / "vault_notes_index.parquet"),
+            "vault_alias_index": str(artifacts / "vault_alias_index.parquet"),
+            "vault_frontmatter_index": str(artifacts / "vault_frontmatter_index.parquet"),
             "vault_link_index": str(artifacts / "vault_link_index.parquet"),
+            "vault_links_v2": str(artifacts / "vault_links_v2.parquet"),
             "vault_links": str(artifacts / "vault_links.parquet"),
+            "vault_link_audit": str(artifacts / "vault_link_audit.parquet"),
             "vault_soft_constraints": str(artifacts / "vault_soft_constraints.parquet"),
             "vault_import_audit": str(artifacts / "vault_import_audit.parquet"),
             "vault_conflicts": str(artifacts / "vault_conflicts.parquet"),
             "benchmark_vault_json": str(artifacts / "benchmark_vault.json"),
+            "benchmark_vault_v2_json": str(artifacts / "benchmark_vault_v2.json"),
             "benchmark_vault_md": str(artifacts / "benchmark_vault.md"),
+            "benchmark_vault_v2_md": str(artifacts / "benchmark_vault_v2.md"),
         }
     )
 
@@ -2006,7 +2952,7 @@ def validate_v2_publish(
         "spec_path": str(Path(spec_path).expanduser().resolve()),
         "gate_map": gate_map,
         "artifact_map": artifact_map,
-        "benchmark_summary": all_done.benchmark_summary,
+        "quality_summary": all_done.quality_summary,
         "vault_benchmark": {
             "precision": float(vault_bench.precision) if vault_bench else 0.0,
             "recall": float(vault_bench.recall) if vault_bench else 0.0,

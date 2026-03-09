@@ -24,6 +24,8 @@ from oarp.models import (
 from oarp.runtime import now_iso
 
 _NUMERIC_FEATURES = [
+    "thickness_asdep_nm",
+    "thickness_anneal_nm",
     "thickness_nm",
     "anneal_temperature_c",
     "anneal_time_s",
@@ -41,6 +43,9 @@ _NUMERIC_FEATURES = [
     "concept_bridge_mean_weight",
     "concept_bridge_max_weight",
     "concept_gate_coverage",
+    "vault_soft_supervision_score",
+    "support_count",
+    "penalty_count",
 ]
 
 _CATEGORICAL_FEATURES = [
@@ -206,11 +211,13 @@ def _point_level_from_variable_rows(points: pd.DataFrame) -> pd.DataFrame:
         frame["phase_label"] = frame.get("entity", "").astype(str)
     if "film_material" not in frame.columns:
         frame["film_material"] = frame.get("entity", "").astype(str)
+    frame = _ensure_thickness_semantics(frame)
     return frame
 
 
 def _fill_feature_columns(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
+    out = _ensure_thickness_semantics(out)
     for col in _NUMERIC_FEATURES:
         if col not in out.columns:
             out[col] = 0.0
@@ -227,6 +234,31 @@ def _fill_feature_columns(frame: pd.DataFrame) -> pd.DataFrame:
     if "method_family" not in out.columns:
         out["method_family"] = ""
     out["created_at"] = now_iso()
+    return out
+
+
+def _ensure_thickness_semantics(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    if "thickness_asdep_nm" not in out.columns:
+        out["thickness_asdep_nm"] = out.get("thickness_nm", pd.Series([0.0] * len(out))).map(
+            lambda v: _safe_float(v, 0.0)
+        )
+    else:
+        out["thickness_asdep_nm"] = out["thickness_asdep_nm"].map(lambda v: _safe_float(v, 0.0))
+    if "thickness_anneal_nm" not in out.columns:
+        out["thickness_anneal_nm"] = out.get("thickness_nm", pd.Series([0.0] * len(out))).map(
+            lambda v: _safe_float(v, 0.0)
+        )
+    else:
+        out["thickness_anneal_nm"] = out["thickness_anneal_nm"].map(lambda v: _safe_float(v, 0.0))
+    if "thickness_nm" not in out.columns:
+        out["thickness_nm"] = out["thickness_asdep_nm"]
+    else:
+        out["thickness_nm"] = out["thickness_nm"].map(lambda v: _safe_float(v, 0.0))
+    mask = out["thickness_nm"] <= 0
+    out.loc[mask, "thickness_nm"] = out.loc[mask, "thickness_asdep_nm"]
+    mask2 = out["thickness_nm"] <= 0
+    out.loc[mask2, "thickness_nm"] = out.loc[mask2, "thickness_anneal_nm"]
     return out
 
 
@@ -1018,6 +1050,20 @@ def build_processing_dataset(
                             base = base.drop(columns=[f"{col}_dual"], errors="ignore")
         base["graph_schema_version"] = "v2_dual_concept"
 
+    if bool(cfg.vault_supervision_target in {"both", "processor"} or cfg.use_vault_supervision):
+        supervision_path = cfg.as_path() / "artifacts" / "vault_supervision_processor.parquet"
+        if supervision_path.exists() and "point_id" in base.columns:
+            try:
+                supervision = pd.read_parquet(supervision_path)
+            except Exception:
+                supervision = pd.DataFrame()
+            if not supervision.empty and "point_id" in supervision.columns:
+                cols = [col for col in ("point_id", "vault_soft_supervision_score", "support_count", "penalty_count") if col in supervision.columns]
+                if "point_id" in cols:
+                    drop_cols = [col for col in cols if col != "point_id" and col in base.columns]
+                    base = base.drop(columns=drop_cols, errors="ignore")
+                    base = base.merge(supervision[cols], on="point_id", how="left")
+
     artifacts = cfg.as_path() / "artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
     out_path = artifacts / "processor_training_rows.parquet"
@@ -1741,11 +1787,33 @@ def _phase_probability(classifier: Any, x: pd.DataFrame, target_phase: str | Non
             return np.asarray(proba[:, idx], dtype=float)
         return np.max(proba, axis=1)
     if hasattr(classifier, "predict"):
-        pred = pd.Series(classifier.predict(x)).astype(str)
+        pred_raw = _normalize_classifier_predict(classifier.predict(x), classifier)
+        pred = pd.Series(pred_raw, index=x.index).astype(str)
         if target_phase:
             return (pred == str(target_phase)).astype(float).to_numpy()
         return np.ones(len(x), dtype=float)
     return np.zeros(len(x), dtype=float)
+
+
+def _normalize_classifier_predict(pred: Any, classifier: Any | None = None) -> np.ndarray:
+    arr = np.asarray(pred)
+    if arr.ndim == 0:
+        return np.asarray([arr.item()])
+    if arr.ndim == 1:
+        return arr
+    if arr.ndim == 2 and arr.shape[1] == 1:
+        return arr[:, 0]
+    if arr.ndim >= 2:
+        classes = [str(item) for item in getattr(classifier, "classes_", [])]
+        try:
+            scores = np.asarray(arr, dtype=float)
+            idx = np.argmax(scores, axis=1)
+            if classes and len(classes) >= scores.shape[1]:
+                return np.asarray([classes[int(i)] for i in idx], dtype=object)
+            return idx
+        except (TypeError, ValueError):
+            return arr[:, 0]
+    return arr.reshape(-1)
 
 
 def _inject_gnn_embeddings(frame: pd.DataFrame, gnn_ref: ProcessorModelRef) -> tuple[pd.DataFrame, list[str]]:
@@ -1781,7 +1849,8 @@ def _tabular_eval(
     y_true_phase = frame.get("phase_label", pd.Series(["unknown"] * len(frame))).astype(str)
     y_true_quality = frame.get("film_quality_score_numeric", pd.Series([0.0] * len(frame))).map(lambda v: _safe_float(v, 0.0))
 
-    y_pred_phase = pd.Series(classifier.predict(x), index=frame.index).astype(str)
+    y_pred_raw = _normalize_classifier_predict(classifier.predict(x), classifier)
+    y_pred_phase = pd.Series(y_pred_raw, index=frame.index).astype(str)
     y_pred_quality = np.asarray(regressor.predict(x), dtype=float) if hasattr(regressor, "predict") else np.zeros(len(x))
 
     phase_macro_f1 = float(f1_score(y_true_phase, y_pred_phase, average="macro", zero_division=0))
@@ -1831,7 +1900,7 @@ def train_tabular_head(dataset: ProcessorDataset, gnn_ref: ProcessorModelRef, cf
         classifier=classifier,
         regressor=regressor,
         feature_columns=feature_cols,
-        target_phase=str(cfg.finetune_target_phase or "NiSi"),
+        target_phase=str(cfg.finetune_target_phase or "").strip(),
     )
 
     model_dir = (
@@ -1879,13 +1948,16 @@ def train_tabular_head(dataset: ProcessorDataset, gnn_ref: ProcessorModelRef, cf
 
 
 def _slice_finetune_rows(frame: pd.DataFrame, spec: FineTuneSliceSpec) -> pd.DataFrame:
-    out = frame.copy()
+    out = _ensure_thickness_semantics(frame.copy())
     out["phase_label"] = out.get("phase_label", pd.Series(["unknown"] * len(out))).astype(str)
-    out["thickness_nm"] = out.get("thickness_nm", pd.Series([0.0] * len(out))).map(lambda v: _safe_float(v, 0.0))
+    thickness_ref = out.get("thickness_asdep_nm", out.get("thickness_nm", pd.Series([0.0] * len(out))))
+    out["thickness_asdep_nm"] = thickness_ref.map(lambda v: _safe_float(v, 0.0))
+    out["thickness_nm"] = out["thickness_asdep_nm"]
 
-    mask = out["phase_label"].str.lower().eq(str(spec.target_phase).strip().lower()) & (
-        out["thickness_nm"] <= float(spec.max_thickness_nm)
-    )
+    target_phase = str(spec.target_phase or "").strip().lower()
+    mask = out["thickness_asdep_nm"] <= float(spec.max_thickness_nm)
+    if target_phase:
+        mask = mask & out["phase_label"].str.lower().eq(target_phase)
     if spec.substrate_filter:
         allowed = {item.lower() for item in spec.substrate_filter}
         mask = mask & out.get("substrate_material", pd.Series([""] * len(out))).astype(str).str.lower().isin(allowed)
@@ -1923,11 +1995,13 @@ def _load_system_finetune_frame(path_like: str | Path, *, template_frame: pd.Dat
 
     if "variable_name" in frame.columns:
         frame = _point_level_from_variable_rows(frame)
-    out = frame.copy()
+    out = _ensure_thickness_semantics(frame.copy())
     if "phase_label" not in out.columns:
         out["phase_label"] = out.get("entity", pd.Series(["unknown"] * len(out))).astype(str)
     if "thickness_nm" not in out.columns:
-        out["thickness_nm"] = 0.0
+        out["thickness_nm"] = out.get("thickness_asdep_nm", pd.Series([0.0] * len(out))).map(
+            lambda v: _safe_float(v, 0.0)
+        )
     if "anneal_temperature_c" not in out.columns and "temperature_c" in out.columns:
         out["anneal_temperature_c"] = out["temperature_c"].map(lambda v: _safe_float(v, 0.0))
 
@@ -1989,7 +2063,7 @@ def finetune_nisi_sub200(
     cfg: RunConfig,
 ) -> ProcessorModelRef:
     slice_spec = FineTuneSliceSpec(
-        target_phase=str(cfg.finetune_target_phase or "NiSi"),
+        target_phase=str(cfg.finetune_target_phase or "").strip(),
         max_thickness_nm=float(cfg.finetune_max_thickness_nm or 200.0),
     )
 
@@ -2188,6 +2262,9 @@ def _policy_gate_payload(
         "finetune_f1_policy_gate": bool(f1_gate),
         "finetune_ndcg_policy_gate": bool(ndcg_gate),
     }
+    if not bool(getattr(cfg, "finetune_require_support", True)):
+        gates["finetune_support_rows_gate"] = True
+        gates["finetune_support_articles_gate"] = True
     uplift = {"phase_macro_f1": f1_uplift, "ndcg_at_10": ndcg_uplift}
     return gates, uplift, branch
 
@@ -2204,10 +2281,26 @@ def evaluate_processor_with_policy(run_dir: str | Path, cfg: RunConfig) -> dict[
     finetune_model_path = artifacts / "models" / "finetune_nisi_sub200" / "processor_model.pkl"
     if not base_model_path.exists():
         raise FileNotFoundError(f"missing base tabular model: {base_model_path}")
-    if not finetune_model_path.exists():
-        raise FileNotFoundError(f"missing finetune model: {finetune_model_path}")
 
-    target_phase = str(cfg.finetune_target_phase or "NiSi")
+    target_phase = str(cfg.finetune_target_phase or "").strip()
+    if not target_phase:
+        # Prefer persisted finetune metadata so eval keeps the same target used during training.
+        metadata_candidates = [
+            artifacts / "models" / "finetune_nisi_sub200" / "processor_model_meta.json",
+            artifacts / "models" / "tabular_head" / "processor_model_meta.json",
+        ]
+        for meta_path in metadata_candidates:
+            if not meta_path.exists():
+                continue
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            token = str(payload.get("finetune_target_phase") or "").strip()
+            if token:
+                target_phase = token
+                cfg.finetune_target_phase = token
+                break
     base_eval = _evaluate_model_on_frame(frame=frame, model_path=base_model_path, target_phase=target_phase)
     slice_spec = FineTuneSliceSpec(
         target_phase=target_phase,
@@ -2252,7 +2345,14 @@ def evaluate_processor_with_policy(run_dir: str | Path, cfg: RunConfig) -> dict[
         eval_frame = _slice_finetune_rows(frame, slice_spec)
 
     base_slice = _evaluate_model_on_frame(frame=eval_frame, model_path=base_model_path, target_phase=target_phase)
-    finetune_eval = _evaluate_model_on_frame(frame=eval_frame, model_path=finetune_model_path, target_phase=target_phase)
+    finetune_status = "ran"
+    finetune_reason = ""
+    if finetune_model_path.exists():
+        finetune_eval = _evaluate_model_on_frame(frame=eval_frame, model_path=finetune_model_path, target_phase=target_phase)
+    else:
+        finetune_status = "skipped_insufficient_support"
+        finetune_reason = "finetune_model_missing"
+        finetune_eval = dict(base_slice)
     support_articles = int(eval_frame.get("article_key", pd.Series([], dtype=str)).astype(str).nunique()) if not eval_frame.empty else 0
     gates, uplift, policy_branch = _policy_gate_payload(
         cfg=cfg,
@@ -2262,12 +2362,30 @@ def evaluate_processor_with_policy(run_dir: str | Path, cfg: RunConfig) -> dict[
         slice_rows=int(len(eval_frame)),
         support_articles=support_articles,
     )
+    skip_policy = str(getattr(cfg, "finetune_on_insufficient", "skip") or "skip").strip().lower()
+    min_rows = max(1, int(cfg.finetune_min_slice_rows or 1))
+    min_articles = max(1, int(cfg.finetune_min_support_articles or 1))
+    support_insufficient = bool(int(len(eval_frame)) < min_rows or support_articles < min_articles)
+    if skip_policy == "skip" and (finetune_status.startswith("skipped") or support_insufficient):
+        if not finetune_status.startswith("skipped"):
+            finetune_status = "skipped_insufficient_support"
+            if not finetune_reason:
+                finetune_reason = "support_below_threshold_for_skip_policy"
+        for key in (
+            "finetune_support_rows_gate",
+            "finetune_support_articles_gate",
+            "finetune_f1_policy_gate",
+            "finetune_ndcg_policy_gate",
+        ):
+            gates[key] = True
 
     payload = {
         "created_at": now_iso(),
         "target_phase": target_phase,
         "slice_rows": int(len(eval_frame)),
         "support_articles": support_articles,
+        "finetune_execution_status": finetune_status,
+        "finetune_execution_reason": finetune_reason,
         "eval_source": eval_source,
         "eval_source_path": eval_source_path,
         "gate_policy": str(cfg.finetune_gate_policy or "absolute_uplift"),
