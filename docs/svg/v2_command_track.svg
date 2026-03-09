@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="760" viewBox="0 0 1600 760">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a1117"/>
+      <stop offset="100%" stop-color="#10252d"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9effe2"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="760" fill="url(#bg)"/>
+  <text x="70" y="86" fill="#ecfff7" font-size="44" font-family="Segoe UI, Arial, sans-serif" font-weight="700">One Run, Full Pulse</text>
+  <text x="70" y="126" fill="#99ffd7" font-size="22" font-family="Segoe UI, Arial, sans-serif">Command rhythm for strict end-to-end execution.</text>
+
+  <rect x="70" y="220" width="1460" height="350" rx="26" fill="#123540" stroke="#6effcf" stroke-width="2"/>
+
+  <rect x="110" y="300" width="180" height="170" rx="18" fill="#1a4e5c"/>
+  <text x="136" y="375" fill="#ecfff7" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">discover</text>
+
+  <rect x="330" y="300" width="180" height="170" rx="18" fill="#1a4e5c"/>
+  <text x="362" y="375" fill="#ecfff7" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">acquire</text>
+
+  <rect x="550" y="300" width="180" height="170" rx="18" fill="#1a4e5c"/>
+  <text x="588" y="375" fill="#ecfff7" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">extract</text>
+
+  <rect x="770" y="300" width="180" height="170" rx="18" fill="#1a4e5c"/>
+  <text x="792" y="375" fill="#ecfff7" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">mp-enrich</text>
+
+  <rect x="990" y="300" width="180" height="170" rx="18" fill="#1a4e5c"/>
+  <text x="1020" y="375" fill="#ecfff7" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">validate</text>
+
+  <rect x="1210" y="300" width="180" height="170" rx="18" fill="#1a4e5c"/>
+  <text x="1236" y="375" fill="#ecfff7" font-size="24" font-family="Segoe UI, Arial, sans-serif" font-weight="700">consensus</text>
+
+  <line x1="290" y1="385" x2="330" y2="385" stroke="#9effe2" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="510" y1="385" x2="550" y2="385" stroke="#9effe2" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="730" y1="385" x2="770" y2="385" stroke="#9effe2" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="950" y1="385" x2="990" y2="385" stroke="#9effe2" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="1170" y1="385" x2="1210" y2="385" stroke="#9effe2" stroke-width="4" marker-end="url(#arrow)"/>
+
+  <text x="260" y="650" fill="#dcfff1" font-size="24" font-family="Segoe UI, Arial, sans-serif">Then: quality-eval -> graph-build -> vault-export/import -> GNN -> tabular -> fine-tune -> processor-eval</text>
+</svg>

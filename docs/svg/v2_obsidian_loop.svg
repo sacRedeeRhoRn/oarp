@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#10131f"/>
+      <stop offset="100%" stop-color="#1f1430"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#ffc8f2"/>
+    </marker>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <text x="70" y="85" fill="#fff0fc" font-size="44" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Obsidian Knowledge Loop</text>
+  <text x="70" y="125" fill="#ffc6f0" font-size="22" font-family="Segoe UI, Arial, sans-serif">Per-run vault projection with soft supervision back into graph and processor.</text>
+
+  <rect x="90" y="220" width="420" height="160" rx="24" fill="#3e2756" stroke="#ffb8ea" stroke-width="2"/>
+  <text x="120" y="285" fill="#fff2fd" font-size="28" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Machine Artifacts</text>
+  <text x="120" y="324" fill="#ffd7f7" font-size="20" font-family="Segoe UI, Arial, sans-serif">validated points + concept edges</text>
+
+  <rect x="590" y="220" width="420" height="160" rx="24" fill="#3e2756" stroke="#ffb8ea" stroke-width="2"/>
+  <text x="620" y="285" fill="#fff2fd" font-size="28" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Vault Export</text>
+  <text x="620" y="324" fill="#ffd7f7" font-size="20" font-family="Segoe UI, Arial, sans-serif">Articles, Concepts, Events, Recipes</text>
+
+  <rect x="1090" y="220" width="420" height="160" rx="24" fill="#3e2756" stroke="#ffb8ea" stroke-width="2"/>
+  <text x="1120" y="285" fill="#fff2fd" font-size="28" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Human Curation</text>
+  <text x="1120" y="324" fill="#ffd7f7" font-size="20" font-family="Segoe UI, Arial, sans-serif">links, aliases, transclusions</text>
+
+  <rect x="590" y="520" width="420" height="160" rx="24" fill="#3e2756" stroke="#ffb8ea" stroke-width="2"/>
+  <text x="620" y="585" fill="#fff2fd" font-size="28" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Vault Import</text>
+  <text x="620" y="624" fill="#ffd7f7" font-size="20" font-family="Segoe UI, Arial, sans-serif">delta links + alias updates</text>
+
+  <rect x="1090" y="520" width="420" height="160" rx="24" fill="#3e2756" stroke="#ffb8ea" stroke-width="2"/>
+  <text x="1120" y="585" fill="#fff2fd" font-size="28" font-family="Segoe UI, Arial, sans-serif" font-weight="700">Soft Supervision</text>
+  <text x="1120" y="624" fill="#ffd7f7" font-size="20" font-family="Segoe UI, Arial, sans-serif">bridge weight + processor features</text>
+
+  <line x1="510" y1="300" x2="590" y2="300" stroke="#ffc8f2" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="1010" y1="300" x2="1090" y2="300" stroke="#ffc8f2" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="1300" y1="380" x2="860" y2="520" stroke="#ffc8f2" stroke-width="4" marker-end="url(#arrow)"/>
+  <line x1="1010" y1="600" x2="1090" y2="600" stroke="#ffc8f2" stroke-width="4" marker-end="url(#arrow)"/>
+  <path d="M 1298 680 C 1260 760, 880 780, 320 380" fill="none" stroke="#ffc8f2" stroke-width="4" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+
+  <text x="230" y="770" fill="#ffe5fa" font-size="22" font-family="Segoe UI, Arial, sans-serif">No hard override. Human edits become weighted hints, never silent force.</text>
+</svg>
